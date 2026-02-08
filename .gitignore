@@ -1,0 +1,106 @@
+
+# ============================================
+# Zephyr RTOS Build Artifacts
+# ============================================
+build/
+.cache/
+.west/
+
+# Zephyr modules (downloaded by west)
+zephyr/
+modules/
+tools/
+bootloader/
+
+# ============================================
+# Compiled Object Files
+# ============================================
+*.o
+*.a
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.d
+*.su
+
+# ============================================
+# IDE and Editor Files
+# ============================================
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# JetBrain IDEs (CLion, IntelliJ)
+.idea/
+*.iml
+
+# Vim
+*.swp
+*.swo
+*~
+.*.sw?
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Eclipse
+.project
+.cproject
+.settings/
+
+# ============================================
+# Operating System Files
+# ============================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+.Trash-*
+
+# ============================================
+# Python (if you add Python scripts)
+# ============================================
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+
+# ============================================
+# Logs and Temporary Files
+# ============================================
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+
+# ============================================
+# Project Specific
+# ============================================
+# If you create local test scripts
+test_local/
+scratch/
+
+# Personal notes (if you keep them in repo)
+notes.txt
+TODO_local.md
