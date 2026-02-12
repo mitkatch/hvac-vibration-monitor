@@ -9,4 +9,5 @@ target_sources(app PRIVATE
     src/main.c
     src/sensor.c
     src/analysis.c
+    src/ble.c
 )
