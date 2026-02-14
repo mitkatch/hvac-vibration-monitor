@@ -1,51 +1,30 @@
 /*
- * Vibration Analysis Helper Functions
+ * analysis.h — On-device vibration analysis
+ *
+ * Optional analysis that runs on the nRF52840 before
+ * or after BLE transmission. Currently computes RMS
+ * values. Could expand to peak detection, threshold
+ * alarms, etc.
  */
 
 #ifndef ANALYSIS_H
 #define ANALYSIS_H
 
-#include "sensor.h"
-#include <stdint.h>
+#include "fsm.h"
 
-/**
- * Print sample data for debugging
- * 
- * @param buffer Sample buffer
- * @param count Number of samples
- */
-void analysis_print_samples(const accel_sample_t *buffer, uint16_t count);
+/* RMS analysis result */
+typedef struct {
+	uint32_t rms_x;     /* RMS in mg */
+	uint32_t rms_y;
+	uint32_t rms_z;
+	int16_t  peak_x;    /* Peak value in raw counts */
+	int16_t  peak_y;
+	int16_t  peak_z;
+} vibration_stats_t;
 
-/**
- * Calculate RMS (Root Mean Square) vibration level
- * 
- * @param buffer Sample buffer
- * @param count Number of samples
- */
-void analysis_calculate_rms(const accel_sample_t *buffer, uint16_t count);
-
-/**
- * Find peak values in buffer
- * 
- * @param buffer Sample buffer
- * @param count Number of samples
- */
-void analysis_find_peaks(const accel_sample_t *buffer, uint16_t count);
-
-/**
- * Calculate mean (average) values
- * 
- * @param buffer Sample buffer
- * @param count Number of samples
- */
-void analysis_calculate_mean(const accel_sample_t *buffer, uint16_t count);
-
-/**
- * Print statistics summary
- * 
- * @param buffer Sample buffer
- * @param count Number of samples
- */
-void analysis_print_summary(const accel_sample_t *buffer, uint16_t count);
+/* Compute RMS and peak values from a sample buffer */
+int analysis_compute_stats(const accel_sample_t *buffer,
+			   uint16_t count,
+			   vibration_stats_t *stats);
 
 #endif /* ANALYSIS_H */

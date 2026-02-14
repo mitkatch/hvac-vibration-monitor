@@ -1,63 +1,67 @@
 /*
- * ADXL343 Sensor Interface
- * Hardware-specific functions for ADXL343 accelerometer
+ * sensor.h — Common sensor interface
+ *
+ * Provides a unified API for the FSM to interact with sensors.
+ * Each physical sensor (ADXL343, BME280, future additions)
+ * lives in its own .c file and implements its own init/collect.
+ *
+ * File layout:
+ *   sensor.h              — this file (shared API)
+ *   sensor_adxl343.c      — ADXL343 accelerometer driver
+ *   sensor_bme280.c       — BME280 environment driver (optional)
+ *   sensor_piezo.c        — piezoelectric high-freq (future)
+ *
+ * Adding a new sensor:
+ *   1. Create sensor_xxx.c with init and collect functions
+ *   2. Add declarations to this header
+ *   3. Call init from system_init() in main.c
+ *   4. Call collect from FSM at appropriate state
  */
 
 #ifndef SENSOR_H
 #define SENSOR_H
 
-#include <zephyr/kernel.h>
-#include <stdint.h>
+#include "fsm.h"
 
-/* Configuration */
-#define SAMPLE_RATE_HZ      1600
-#define SAMPLES_PER_BURST   512
-#define SAMPLE_PERIOD_US    (1000000 / SAMPLE_RATE_HZ)
+/* ──────────────────────────────────────────────
+ * Vibration Sensor (ADXL343)
+ * Implemented in: sensor_adxl343.c
+ * ────────────────────────────────────────────── */
 
-/* ADXL343 I2C Address */
-#define ADXL343_I2C_ADDR       0x53
+/* Initialize ADXL343 over I2C, configure sample rate and range.
+ * Returns 0 on success, negative error code on failure. */
+int sensor_init_vibration(void);
 
-/* Data structure for one XYZ snapshot */
-typedef struct {
-	int16_t x;
-	int16_t y;
-	int16_t z;
-} __packed accel_sample_t;
+/* Collect a burst of vibration samples into buffer.
+ * Blocks for ~320ms at 1600 Hz / 512 samples.
+ * Returns number of samples collected, or negative error. */
+int sensor_collect_vibration(accel_sample_t *buffer, uint16_t max_samples);
 
-/**
- * Initialize ADXL343 sensor
- * 
- * @return 0 on success, negative error code on failure
- */
-int sensor_init(void);
+/* ──────────────────────────────────────────────
+ * Environment Sensor (BME280)
+ * Implemented in: sensor_bme280.c
+ * ────────────────────────────────────────────── */
 
-/**
- * Read one XYZ snapshot (atomic read of all 3 axes)
- * 
- * @param sample Pointer to store the sample
- * @return 0 on success, negative error code on failure
- */
-int sensor_read_snapshot(accel_sample_t *sample);
+/* Initialize BME280 over I2C.
+ * Returns 0 on success, negative if sensor not found.
+ * Not finding the sensor is non-fatal — system continues without. */
+int sensor_init_environment(void);
 
-/**
- * Collect a burst of snapshots at precise timing
- * 
- * @param buffer Buffer to store samples
- * @param count Number of samples to collect
- * @return 0 on success, negative error code on failure
- */
-int sensor_collect_burst(accel_sample_t *buffer, uint16_t count);
+/* Read temperature, humidity, pressure.
+ * Single I2C transaction, returns in ~10ms.
+ * Returns 0 on success, negative on error.
+ * Sets reading->valid = true on success. */
+int sensor_collect_environment(env_reading_t *reading);
 
-/**
- * Convert raw LSB value to milli-g
- * 
- * @param lsb Raw sensor value
- * @return Value in milli-g
- */
-static inline int32_t sensor_lsb_to_mg(int16_t lsb)
-{
-	/* Full resolution: 4 mg/LSB for all ranges */
-	return (int32_t)lsb * 4;
-}
+/* ──────────────────────────────────────────────
+ * Piezoelectric Sensor (future)
+ * Implemented in: sensor_piezo.c
+ *
+ * Uncomment when hardware is ready:
+ *
+ * int sensor_init_piezo(void);
+ * int sensor_collect_piezo(int16_t *buffer, uint16_t max_samples,
+ *                          uint32_t sample_rate);
+ * ────────────────────────────────────────────── */
 
 #endif /* SENSOR_H */

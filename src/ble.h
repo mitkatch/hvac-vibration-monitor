@@ -1,56 +1,31 @@
 /*
- * BLE Interface for Vibration Data Transmission
+ * ble.h — BLE peripheral service API
+ *
+ * Service functions called by the FSM.
+ * ble.c owns the connection lifecycle internally.
  */
 
 #ifndef BLE_H
 #define BLE_H
 
-#include "sensor.h"
-#include <stdint.h>
+#include "fsm.h"
 
-/**
- * Initialize BLE stack and start advertising
- * 
- * @return 0 on success, negative error code on failure
- */
-int ble_init(void);
+/* Initialize BLE stack and register event callback */
+int ble_init(event_post_fn callback);
 
-/**
- * Start BLE advertising (make device discoverable)
- * 
- * @return 0 on success, negative error code on failure
- */
-int ble_start_advertising(void);
+/* Advertising control */
+int  ble_start_advertising(void);
+int  ble_stop_advertising(void);
 
-/**
- * Stop BLE advertising
- * 
- * @return 0 on success, negative error code on failure
- */
-int ble_stop_advertising(void);
-
-/**
- * Check if a BLE client is connected
- * 
- * @return true if connected, false otherwise
- */
+/* Connection state queries */
 bool ble_is_connected(void);
+bool ble_notifications_enabled(void);
 
-/**
- * Transmit burst of samples over BLE
- * Splits into multiple packets if needed
- * 
- * @param buffer Sample buffer
- * @param count Number of samples
- * @return 0 on success, negative error code on failure
- */
+/* Cleanup after disconnect (called by FSM on DISCONNECTED entry) */
+void ble_cleanup(void);
+
+/* Data transmission (called synchronously by FSM) */
 int ble_transmit_burst(const accel_sample_t *buffer, uint16_t count);
-
-/**
- * Get BLE connection status string
- * 
- * @return Status string (for logging)
- */
-const char *ble_get_status(void);
+int ble_transmit_environment(const env_reading_t *reading);
 
 #endif /* BLE_H */
