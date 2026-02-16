@@ -123,4 +123,33 @@ typedef struct {
  * ────────────────────────────────────────────── */
 typedef void (*event_post_fn)(const fsm_event_t *evt);
 
+/* ──────────────────────────────────────────────
+ * Public API Functions
+ * ────────────────────────────────────────────── */
+
+/**
+ * @brief Initialize the FSM subsystem
+ * @param env_sensor_available Whether environmental sensor is present
+ */
+void fsm_init(bool env_sensor_available);
+
+/**
+ * @brief Process a single event through the state machine
+ * @param evt Event to process
+ */
+void fsm_handle_event(const fsm_event_t *evt);
+
+/**
+ * @brief Get pointer to the FSM event queue
+ * @return Pointer to the message queue for FSM events
+ */
+struct k_msgq *fsm_get_event_queue(void);
+
+/**
+ * @brief Post an event to the FSM queue (safe from ISR/callbacks)
+ * @param evt Event to post
+ * @return 0 on success, negative errno on failure
+ */
+int event_post(fsm_event_t *evt);
+
 #endif /* FSM_H */
