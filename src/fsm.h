@@ -44,7 +44,6 @@ typedef struct {
 typedef enum {
 	STATE_INIT,                    /* Hardware initialization */
 	STATE_ADVERTISING,             /* Waiting for connection */
-	STATE_AUTHENTICATING,          /* PIN pairing in progress */
 	STATE_CONNECTED_IDLE,          /* Connected, waiting for burst timer */
 	STATE_COLLECTING_VIBRATION,    /* Reading accelerometer */
 	STATE_COLLECTING_ENVIRONMENT,  /* Reading temp/humidity/pressure */
@@ -73,7 +72,7 @@ typedef enum {
 	EVT_PAIRING_REQUEST,           /* PIN display triggered */
 	EVT_PAIRING_COMPLETE,          /* Authentication succeeded */
 	EVT_PAIRING_FAILED,            /* Wrong PIN or timeout */
-	EVT_AUTH_TIMEOUT,              /* 60 seconds elapsed without pairing */
+	EVT_PAIRING_TIMEOUT,           /* 120 seconds elapsed without pairing */
 
 	/* Timer events */
 	EVT_BURST_TIMER_EXPIRED,

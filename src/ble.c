@@ -26,6 +26,7 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/random/random.h>
+#include <zephyr/settings/settings.h>
 
 #include "ble.h"
 #include "fsm.h"
@@ -171,13 +172,13 @@ BT_GATT_SERVICE_DEFINE(nus_svc,
 			       BT_GATT_PERM_NONE,
 			       NULL, NULL, NULL),
 	BT_GATT_CCC(nus_tx_ccc_changed,
-		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+		    BT_GATT_PERM_READ_AUTHEN | BT_GATT_PERM_WRITE_AUTHEN),
 
 	/* RX characteristic (phone → device) */
 	BT_GATT_CHARACTERISTIC(&nus_rx_uuid.uuid,
 			       BT_GATT_CHRC_WRITE |
 			       BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-			       BT_GATT_PERM_WRITE,
+			       BT_GATT_PERM_WRITE_AUTHEN,
 			       NULL, nus_rx_write, NULL),
 );
 
@@ -194,7 +195,7 @@ BT_GATT_SERVICE_DEFINE(vibration_svc,
 			       BT_GATT_PERM_NONE,
 			       NULL, NULL, NULL),
 	BT_GATT_CCC(vibration_ccc_changed,
-		     BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+		     BT_GATT_PERM_READ_AUTHEN | BT_GATT_PERM_WRITE_AUTHEN),
 
 	/* Environment data characteristic (notify only) */
 	BT_GATT_CHARACTERISTIC(&env_char_uuid.uuid,
@@ -202,7 +203,7 @@ BT_GATT_SERVICE_DEFINE(vibration_svc,
 			       BT_GATT_PERM_NONE,
 			       NULL, NULL, NULL),
 	BT_GATT_CCC(env_ccc_changed,
-		     BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+		     BT_GATT_PERM_READ_AUTHEN | BT_GATT_PERM_WRITE_AUTHEN),
 );
 
 /* ──────────────────────────────────────────────
@@ -211,6 +212,14 @@ BT_GATT_SERVICE_DEFINE(vibration_svc,
  * Handle pairing, passkey display, authentication,
  * and bonding events.
  * ────────────────────────────────────────────── */
+
+static void auth_passkey_confirm(struct bt_conn *conn, unsigned int passkey)
+{
+	/* Some platforms (like Windows) need explicit confirmation
+	 * Auto-confirm since we're displaying the passkey */
+	LOG_INF("Passkey confirm request: %06u (auto-confirming)", passkey);
+	bt_conn_auth_passkey_confirm(conn);
+}
 
 static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
 {
@@ -221,26 +230,24 @@ static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
 	/* Store for validation */
 	current_passkey = passkey;
 
-	/* Send PIN to NUS UART terminal */
-	char pin_msg[128];
+	/* Send PIN to NUS UART terminal
+	 * Keep message simple and clear for nRF Connect display */
+	char pin_msg[64];
 	int len = snprintk(pin_msg, sizeof(pin_msg),
-		"\r\n"
-		"═══════════════════════════════════\r\n"
-		"  HVAC VIBRATION MONITOR\r\n"
-		"═══════════════════════════════════\r\n"
-		"\r\n"
-		"  PAIRING PIN: %06u\r\n"
-		"\r\n"
-		"Enter this code when your\r\n"
-		"device prompts for pairing.\r\n"
-		"\r\n"
-		"PIN valid for 60 seconds.\r\n"
-		"═══════════════════════════════════\r\n",
-		passkey);
+		"PIN: %06u\r\n", passkey);
 
+	/* Try to send immediately if NUS is enabled */
 	if (nus_tx_enabled && current_conn) {
-		bt_gatt_notify(current_conn, &nus_svc.attrs[2],
-			       pin_msg, len);
+		int err = bt_gatt_notify(current_conn, &nus_svc.attrs[2],
+				         pin_msg, len);
+		if (err) {
+			LOG_WRN("Failed to send PIN via NUS (err %d)", err);
+		} else {
+			LOG_INF("PIN sent via NUS");
+		}
+	} else {
+		LOG_WRN("NUS not enabled yet - PIN only visible in logs");
+		LOG_INF("Enable notifications on Nordic UART Service TX to see PIN");
 	}
 
 	/* Post event to FSM */
@@ -293,6 +300,7 @@ static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
 
 static struct bt_conn_auth_cb auth_callbacks = {
 	.passkey_display = auth_passkey_display,
+	.passkey_confirm = auth_passkey_confirm,
 	.cancel = auth_cancel,
 };
 
@@ -396,6 +404,8 @@ static void bt_ready_callback(int err)
 		settings_load();
 	}
 	
+	LOG_INF("BLE: Settings loaded, stack ready");
+	
 	/* Post event to FSM that BLE is ready */
 	if (post_event) {
 		fsm_event_t evt = { .type = EVT_BLE_READY };
@@ -412,9 +422,16 @@ int ble_init(event_post_fn callback)
 	int err;
 
 	post_event = callback;
-	// 1. Initialize settings BEFORE bt_enable()
-	settings_subsys_init();
 
+	/* Initialize settings subsystem first (required for bonding) */
+	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
+		err = settings_subsys_init();
+		if (err) {
+			LOG_ERR("BLE: Settings subsystem init failed (err %d)", err);
+			return err;
+		}
+		LOG_INF("BLE: Settings subsystem initialized");
+	}
 
 	/* Enable BLE stack - settings will load asynchronously */
 	err = bt_enable(bt_ready_callback);
