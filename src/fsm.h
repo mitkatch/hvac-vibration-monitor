@@ -8,157 +8,120 @@
 #ifndef FSM_H
 #define FSM_H
 
+#include <zephyr/kernel.h>
 #include <stdint.h>
 #include <stdbool.h>
 
 /* ──────────────────────────────────────────────
- * FSM States
+ * Sensor Data Types
+ * 
+ * These types are defined here (in fsm.h) because
+ * they're used across multiple modules: main.c,
+ * ble.c, sensor_*.c, and analysis.c
+ * ────────────────────────────────────────────── */
+
+/* Single 3-axis accelerometer sample (ADXL343) */
+typedef struct {
+	int16_t x;
+	int16_t y;
+	int16_t z;
+} accel_sample_t;
+
+/* Environmental sensor reading (BME280) */
+typedef struct {
+	int16_t  temperature;  /* °C * 100 (e.g., 2550 = 25.50°C) */
+	uint16_t humidity;     /* % * 100  (e.g., 6432 = 64.32%) */
+	uint32_t pressure;     /* Pascals  (e.g., 101325 = 1013.25 hPa) */
+	bool     valid;        /* true if reading succeeded */
+} env_reading_t;
+
+/* Vibration burst size */
+#define VIBRATION_BURST_SIZE    512
+
+/* ──────────────────────────────────────────────
+ * System States
  * ────────────────────────────────────────────── */
 typedef enum {
-	STATE_INIT = 0,
-	STATE_ADVERTISING,
-	STATE_CONNECTED_IDLE,
-	STATE_COLLECTING_VIBRATION,
-	STATE_COLLECTING_ENVIRONMENT,
-	STATE_TRANSMITTING,
-	STATE_DISCONNECTED,
-	STATE_RECOVERY,
-	STATE_ERROR,
-	STATE_COUNT  /* sentinel — number of states */
+	STATE_INIT,                    /* Hardware initialization */
+	STATE_ADVERTISING,             /* Waiting for connection */
+	STATE_AUTHENTICATING,          /* PIN pairing in progress */
+	STATE_CONNECTED_IDLE,          /* Connected, waiting for burst timer */
+	STATE_COLLECTING_VIBRATION,    /* Reading accelerometer */
+	STATE_COLLECTING_ENVIRONMENT,  /* Reading temp/humidity/pressure */
+	STATE_TRANSMITTING,            /* Sending BLE notifications */
+	STATE_DISCONNECTED,            /* Cleanup after disconnect */
+	STATE_RECOVERY,                /* Retry after error */
+	STATE_ERROR,                   /* Fatal error */
 } fsm_state_t;
 
 /* ──────────────────────────────────────────────
  * Event Types
- *
- * Grouped by source for readability.
- * The FSM switches on these to decide actions.
  * ────────────────────────────────────────────── */
 typedef enum {
-	/* System */
-	EVT_INIT_COMPLETE = 0,
+	/* Initialization events */
+	EVT_INIT_COMPLETE,
 	EVT_INIT_FAILED,
 
-	/* BLE */
+	/* BLE connection events */
+	EVT_BLE_READY,                 /* BLE stack ready (settings loaded) */
 	EVT_BLE_CONNECTED,
 	EVT_BLE_DISCONNECTED,
-	EVT_BLE_ADV_STARTED,
-	EVT_BLE_ADV_FAILED,
-	EVT_BLE_TX_COMPLETE,
-	EVT_BLE_TX_FAILED,
 	EVT_BLE_NOTIFICATIONS_ENABLED,
 	EVT_BLE_NOTIFICATIONS_DISABLED,
 
-	/* Sensor */
-	EVT_VIBRATION_COLLECT_DONE,
-	EVT_VIBRATION_COLLECT_FAILED,
-	EVT_ENV_COLLECT_DONE,
-	EVT_ENV_COLLECT_FAILED,
+	/* Security/pairing events */
+	EVT_PAIRING_REQUEST,           /* PIN display triggered */
+	EVT_PAIRING_COMPLETE,          /* Authentication succeeded */
+	EVT_PAIRING_FAILED,            /* Wrong PIN or timeout */
+	EVT_AUTH_TIMEOUT,              /* 60 seconds elapsed without pairing */
 
-	/* Timers */
+	/* Timer events */
 	EVT_BURST_TIMER_EXPIRED,
 	EVT_CLEANUP_TIMEOUT,
 	EVT_WATCHDOG_TIMEOUT,
 	EVT_RETRY_TIMEOUT,
 
-	EVT_COUNT  /* sentinel */
+	/* Transmission events */
+	EVT_BLE_TX_COMPLETE,
+	EVT_BLE_TX_FAILED,
 } fsm_event_type_t;
 
 /* ──────────────────────────────────────────────
- * Event Payload Union
+ * Event Data Payloads
  *
- * Most events use zero or one field. The union
- * keeps the event struct fixed-size (no malloc).
- * Max payload: 8 bytes.
- * ────────────────────────────────────────────── */
-typedef union {
-	/* EVT_BLE_DISCONNECTED */
-	struct {
-		uint8_t reason;       /* BLE disconnect reason code */
-	} ble_disconnect;
-
-	/* EVT_BLE_TX_FAILED, EVT_INIT_FAILED, etc. */
-	int16_t error_code;
-
-	/* EVT_ENV_COLLECT_DONE (optional inline readings) */
-	struct {
-		int16_t temperature;  /* °C × 100 (e.g. 2350 = 23.50°C) */
-		uint16_t humidity;    /* %RH × 100 */
-		uint16_t pressure;    /* hPa (mbar) */
-	} env;
-
-	/* EVT_VIBRATION_COLLECT_DONE */
-	struct {
-		uint16_t sample_count;
-	} vibration;
-
-	/* Generic 8-byte payload for future use */
-	uint8_t raw[8];
-
-} fsm_event_data_t;
-
-/* ──────────────────────────────────────────────
- * Event Object
- *
- * 16 bytes total, fixed size. Passed by value
- * through k_msgq. No pointers, no dynamic alloc.
- *
- * Layout:
- *   type      : 2 bytes  (what happened)
- *   _reserved : 2 bytes  (alignment / future flags)
- *   timestamp : 4 bytes  (when it happened)
- *   data      : 8 bytes  (context, if any)
+ * Different event types carry different data.
+ * Use a union to keep the struct size reasonable.
  * ────────────────────────────────────────────── */
 typedef struct {
-	fsm_event_type_t  type;        /* What happened                */
-	uint16_t          _reserved;   /* Padding / future flags       */
-	uint32_t          timestamp;   /* k_uptime_get_32() at posting */
-	fsm_event_data_t  data;        /* Payload (union, often unused)*/
+	fsm_event_type_t type;
+	uint32_t timestamp;  /* k_uptime_get_32() when event was posted */
+
+	union {
+		/* BLE disconnection reason */
+		struct {
+			uint8_t reason;
+		} ble_disconnect;
+
+		/* Initialization or transmission error code */
+		int error_code;
+
+		/* Pairing passkey */
+		uint32_t passkey;
+
+		/* Pairing result */
+		bool bonded;
+
+		/* Security error */
+		uint8_t security_error;
+	} data;
 } fsm_event_t;
 
-/* Compile-time sanity check */
-BUILD_ASSERT(sizeof(fsm_event_t) == 16, "Event struct must be 16 bytes");
-
 /* ──────────────────────────────────────────────
- * Event posting function (implemented in main.c)
+ * Event Posting Function Type
  *
- * This is the single entry point for all modules
- * to submit events. BLE callbacks, timer expiries,
- * and sensor completions all call this.
+ * Modules like ble.c call this to post events.
+ * The FSM registers its event queue handler during init.
  * ────────────────────────────────────────────── */
-typedef int (*event_post_fn)(fsm_event_t *evt);
-
-int event_post(fsm_event_t *evt);
-
-/* ──────────────────────────────────────────────
- * Timer control API (implemented in main.c)
- * Called by FSM transition logic.
- * ────────────────────────────────────────────── */
-void timer_start_burst(void);
-void timer_stop_burst(void);
-void timer_start_cleanup(void);
-void timer_stop_cleanup(void);
-void timer_start_tx_watchdog(void);
-void timer_stop_tx_watchdog(void);
-void timer_start_retry(uint32_t delay_ms);
-void timer_stop_retry(void);
-
-/* ──────────────────────────────────────────────
- * Sensor types (shared across modules)
- * ────────────────────────────────────────────── */
-#define VIBRATION_BURST_SIZE    512
-#define SAMPLE_RATE_HZ          1600
-
-typedef struct {
-	int16_t x;
-	int16_t y;
-	int16_t z;
-} __packed accel_sample_t;
-
-typedef struct {
-	int16_t  temperature;   /* °C × 100 */
-	uint16_t humidity;      /* %RH × 100 */
-	uint16_t pressure;      /* hPa */
-	bool     valid;
-} env_reading_t;
+typedef void (*event_post_fn)(const fsm_event_t *evt);
 
 #endif /* FSM_H */

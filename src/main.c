@@ -29,6 +29,7 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define RETRY_BASE_MS           5000
 #define RETRY_MAX_ATTEMPTS      3
 #define EVENT_QUEUE_DEPTH       8
+#define AUTH_TIMEOUT_SEC        60  /* Pairing timeout */
 
 /* ──────────────────────────────────────────────
  * Event Queue (central message bus)
@@ -59,6 +60,7 @@ static void burst_timer_expiry(struct k_timer *timer);
 static void cleanup_timer_expiry(struct k_timer *timer);
 static void tx_watchdog_expiry(struct k_timer *timer);
 static void retry_timer_expiry(struct k_timer *timer);
+static void auth_timeout_expiry(struct k_timer *timer);
 
 /* Forward declaration — defined after fsm_process */
 static void fsm_do_transmit(void);
@@ -67,6 +69,7 @@ K_TIMER_DEFINE(burst_timer,    burst_timer_expiry,   NULL);
 K_TIMER_DEFINE(cleanup_timer,  cleanup_timer_expiry, NULL);
 K_TIMER_DEFINE(tx_watchdog,    tx_watchdog_expiry,   NULL);
 K_TIMER_DEFINE(retry_timer,    retry_timer_expiry,   NULL);
+K_TIMER_DEFINE(auth_timeout,   auth_timeout_expiry,  NULL);
 
 static void burst_timer_expiry(struct k_timer *timer)
 {
@@ -93,6 +96,13 @@ static void retry_timer_expiry(struct k_timer *timer)
 {
 	ARG_UNUSED(timer);
 	fsm_event_t evt = { .type = EVT_RETRY_TIMEOUT };
+	event_post(&evt);
+}
+
+static void auth_timeout_expiry(struct k_timer *timer)
+{
+	ARG_UNUSED(timer);
+	fsm_event_t evt = { .type = EVT_AUTH_TIMEOUT };
 	event_post(&evt);
 }
 
@@ -143,6 +153,17 @@ void timer_stop_retry(void)
 	k_timer_stop(&retry_timer);
 }
 
+void timer_start_auth_timeout(void)
+{
+	k_timer_start(&auth_timeout, K_SECONDS(AUTH_TIMEOUT_SEC), K_NO_WAIT);
+	LOG_DBG("Auth timeout started (%d sec)", AUTH_TIMEOUT_SEC);
+}
+
+void timer_stop_auth_timeout(void)
+{
+	k_timer_stop(&auth_timeout);
+}
+
 /* ──────────────────────────────────────────────
  * FSM State Entry / Exit Actions
  *
@@ -166,6 +187,9 @@ static void state_exit(fsm_state_t old_state)
 	case STATE_CONNECTED_IDLE:
 		timer_stop_burst();
 		break;
+	case STATE_AUTHENTICATING:
+		timer_stop_auth_timeout();
+		break;
 	case STATE_TRANSMITTING:
 		timer_stop_tx_watchdog();
 		break;
@@ -186,6 +210,11 @@ static void state_enter(fsm_state_t new_state)
 	case STATE_ADVERTISING:
 		LOG_INF("→ ADVERTISING");
 		retry_count = 0;
+		break;
+
+	case STATE_AUTHENTICATING:
+		LOG_INF("→ AUTHENTICATING");
+		/* Timer started when EVT_PAIRING_REQUEST received */
 		break;
 
 	case STATE_CONNECTED_IDLE:
@@ -256,6 +285,13 @@ static void fsm_process(const fsm_event_t *evt)
 	/* ── INIT ───────────────────────────────── */
 	case STATE_INIT:
 		if (evt->type == EVT_INIT_COMPLETE) {
+			/* Hardware init done, but BLE stack is still loading settings.
+			 * Wait for EVT_BLE_READY before starting advertising. */
+			LOG_INF("Hardware init complete, waiting for BLE stack...");
+			
+		} else if (evt->type == EVT_BLE_READY) {
+			/* BLE stack ready, settings loaded, safe to advertise */
+			LOG_INF("BLE stack ready, starting advertising");
 			int err = ble_start_advertising();
 			if (err) {
 				LOG_ERR("Initial advertising failed (err %d)", err);
@@ -263,6 +299,7 @@ static void fsm_process(const fsm_event_t *evt)
 			} else {
 				transition(STATE_ADVERTISING);
 			}
+			
 		} else if (evt->type == EVT_INIT_FAILED) {
 			transition(STATE_ERROR);
 		}
@@ -271,9 +308,63 @@ static void fsm_process(const fsm_event_t *evt)
 	/* ── ADVERTISING ────────────────────────── */
 	case STATE_ADVERTISING:
 		if (evt->type == EVT_BLE_CONNECTED) {
-			transition(STATE_CONNECTED_IDLE);
+			/* Check if this is a bonded device (auto-authenticated) */
+			if (ble_is_authenticated()) {
+				LOG_INF("Bonded device reconnected - skip authentication");
+				transition(STATE_CONNECTED_IDLE);
+			} else {
+				LOG_INF("New device - authentication required");
+				transition(STATE_AUTHENTICATING);
+				
+				/* Request security - triggers pairing process */
+				int err = ble_set_security();
+				if (err) {
+					LOG_ERR("Failed to request security (err %d)", err);
+					/* Fall back to unauthenticated connection */
+					transition(STATE_CONNECTED_IDLE);
+				}
+			}
 		}
 		/* All other events ignored while advertising */
+		break;
+
+	/* ── AUTHENTICATING ─────────────────────── */
+	case STATE_AUTHENTICATING:
+		if (evt->type == EVT_PAIRING_REQUEST) {
+			/* PIN has been displayed via NUS - start timeout */
+			timer_start_auth_timeout();
+			LOG_INF("PIN displayed, waiting for user to enter it...");
+			/* Stay in AUTHENTICATING state */
+			
+		} else if (evt->type == EVT_PAIRING_COMPLETE) {
+			/* Authentication successful! */
+			timer_stop_auth_timeout();
+			
+			if (evt->data.bonded) {
+				LOG_INF("Pairing successful - device bonded");
+				LOG_INF("Future connections will skip authentication");
+			} else {
+				LOG_INF("Pairing successful (not bonded)");
+			}
+			
+			transition(STATE_CONNECTED_IDLE);
+			
+		} else if (evt->type == EVT_PAIRING_FAILED) {
+			/* Wrong PIN or user cancelled */
+			timer_stop_auth_timeout();
+			LOG_ERR("Pairing failed - disconnecting");
+			transition(STATE_DISCONNECTED);
+			
+		} else if (evt->type == EVT_AUTH_TIMEOUT) {
+			/* User took too long (60 seconds) */
+			LOG_ERR("Authentication timeout - disconnecting");
+			transition(STATE_DISCONNECTED);
+			
+		} else if (evt->type == EVT_BLE_DISCONNECTED) {
+			/* Connection lost during authentication */
+			timer_stop_auth_timeout();
+			transition(STATE_DISCONNECTED);
+		}
 		break;
 
 	/* ── CONNECTED_IDLE ─────────────────────── */
@@ -283,6 +374,13 @@ static void fsm_process(const fsm_event_t *evt)
 			if (!ble_notifications_enabled()) {
 				LOG_INF("Notifications not enabled, skipping burst");
 				timer_start_burst();  /* restart timer, try next cycle */
+				break;
+			}
+
+			/* SECURITY: Verify device is authenticated before transmitting data */
+			if (!ble_is_authenticated()) {
+				LOG_WRN("Not authenticated - data transmission blocked");
+				timer_start_burst();  /* restart timer, wait for auth */
 				break;
 			}
 

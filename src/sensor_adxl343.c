@@ -20,7 +20,6 @@ LOG_MODULE_REGISTER(adxl343, LOG_LEVEL_INF);
  * ADXL343 Register Map
  * ────────────────────────────────────────────── */
 #define ADXL343_ADDR            0x53
-
 #define ADXL343_DEVID           0x00
 #define ADXL343_BW_RATE         0x2C
 #define ADXL343_POWER_CTL       0x2D
@@ -41,6 +40,7 @@ LOG_MODULE_REGISTER(adxl343, LOG_LEVEL_INF);
 /* FIFO_CTL: stream mode, 32 samples */
 #define FIFO_STREAM_32          0x9F
 
+#define SAMPLE_RATE_HZ  		1600
 /* ──────────────────────────────────────────────
  * I2C Device
  * ────────────────────────────────────────────── */
