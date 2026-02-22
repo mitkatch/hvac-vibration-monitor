@@ -11,6 +11,7 @@
 #include "fsm.h"
 #include "ble.h"
 #include "sensor.h"
+#include "led.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -23,6 +24,13 @@ static int system_init(void)
 
 	LOG_INF("=== HVAC Vibration Monitor ===");
 	LOG_INF("FSM Architecture v1.0");
+
+	/* Initialize LED (for pairing indication) */
+	err = led_init();
+	if (err) {
+		LOG_WRN("LED init failed (err %d), continuing without LED", err);
+		/* Non-fatal error - system can work without LED */
+	}
 
 	/* Initialize BLE (registers event_post as callback sink) */
 	err = ble_init(event_post);

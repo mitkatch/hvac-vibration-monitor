@@ -172,13 +172,21 @@ BT_GATT_SERVICE_DEFINE(nus_svc,
 			       BT_GATT_PERM_NONE,
 			       NULL, NULL, NULL),
 	BT_GATT_CCC(nus_tx_ccc_changed,
+#ifdef BLE_NO_PAIRING
+		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+#else
 		    BT_GATT_PERM_READ_AUTHEN | BT_GATT_PERM_WRITE_AUTHEN),
+#endif
 
 	/* RX characteristic (phone → device) */
 	BT_GATT_CHARACTERISTIC(&nus_rx_uuid.uuid,
 			       BT_GATT_CHRC_WRITE |
 			       BT_GATT_CHRC_WRITE_WITHOUT_RESP,
+#ifdef BLE_NO_PAIRING
+			       BT_GATT_PERM_WRITE,
+#else
 			       BT_GATT_PERM_WRITE_AUTHEN,
+#endif
 			       NULL, nus_rx_write, NULL),
 );
 
@@ -195,7 +203,11 @@ BT_GATT_SERVICE_DEFINE(vibration_svc,
 			       BT_GATT_PERM_NONE,
 			       NULL, NULL, NULL),
 	BT_GATT_CCC(vibration_ccc_changed,
+#ifdef BLE_NO_PAIRING
+		     BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+#else
 		     BT_GATT_PERM_READ_AUTHEN | BT_GATT_PERM_WRITE_AUTHEN),
+#endif
 
 	/* Environment data characteristic (notify only) */
 	BT_GATT_CHARACTERISTIC(&env_char_uuid.uuid,
@@ -203,7 +215,11 @@ BT_GATT_SERVICE_DEFINE(vibration_svc,
 			       BT_GATT_PERM_NONE,
 			       NULL, NULL, NULL),
 	BT_GATT_CCC(env_ccc_changed,
+#ifdef BLE_NO_PAIRING
+		     BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+#else
 		     BT_GATT_PERM_READ_AUTHEN | BT_GATT_PERM_WRITE_AUTHEN),
+#endif
 );
 
 /* ──────────────────────────────────────────────
@@ -440,6 +456,7 @@ int ble_init(event_post_fn callback)
 		return err;
 	}
 
+#ifndef BLE_NO_PAIRING
 	/* Register security callbacks for pairing/bonding */
 	err = bt_conn_auth_cb_register(&auth_callbacks);
 	if (err) {
@@ -452,6 +469,9 @@ int ble_init(event_post_fn callback)
 		LOG_ERR("BLE: Failed to register auth info callbacks (err %d)", err);
 		return err;
 	}
+#else
+	LOG_WRN("BLE: Pairing DISABLED (BLE_NO_PAIRING) — open access for testing");
+#endif
 
 	LOG_INF("BLE: Stack initializing (waiting for settings to load)...");
 	return 0;
@@ -671,6 +691,10 @@ int ble_transmit_environment(const env_reading_t *reading)
 
 int ble_set_security(void)
 {
+#ifdef BLE_NO_PAIRING
+	LOG_WRN("BLE: ble_set_security() skipped (BLE_NO_PAIRING)");
+	return 0;
+#else
 	if (!current_conn) {
 		return -ENOTCONN;
 	}
@@ -684,6 +708,7 @@ int ble_set_security(void)
 
 	LOG_INF("BLE: Security level 3 requested (authenticated pairing)");
 	return 0;
+#endif
 }
 
 bool ble_is_authenticated(void)

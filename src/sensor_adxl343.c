@@ -121,41 +121,95 @@ int sensor_collect_vibration(accel_sample_t *buffer, uint16_t max_samples)
 		return -ENODEV;
 	}
 
-	const uint32_t sample_period_us = 1000000 / SAMPLE_RATE_HZ;  /* 625 µs */
+	/*
+	 * FIFO-driven collection — no software timing.
+	 *
+	 * The ADXL343 clocks samples into its 32-deep FIFO at exactly
+	 * SAMPLE_RATE_HZ. We poll FIFO_STATUS for entries, drain them
+	 * in batches, and repeat until we have max_samples.
+	 *
+	 * FIFO mode changes require standby — do NOT toggle bypass/stream
+	 * while in measurement mode. Instead, flush stale samples by
+	 * draining the FIFO until empty before starting collection.
+	 */
+
+	/* Flush stale FIFO samples.
+	 * At 1600 Hz new samples arrive every 625 µs — faster than we can drain
+	 * in a tight loop. Pause measurement briefly, flush, resume.
+	 * This is safe: standby → flush → measure takes < 1 ms.
+	 */
+	{
+		uint8_t dummy[6];
+		uint8_t status;
+		adxl_write_reg(ADXL343_POWER_CTL, 0x00);  /* standby — stop new samples */
+		for (int i = 0; i < 32; i++) {
+			if (adxl_read_reg(ADXL343_FIFO_STATUS, &status) != 0) break;
+			if ((status & 0x3F) == 0) break;
+			adxl_burst_read(ADXL343_DATAX0, dummy, 6);
+		}
+		adxl_write_reg(ADXL343_POWER_CTL, 0x08);  /* measurement — resume */
+		LOG_DBG("ADXL343: FIFO flushed, measuring");
+	}
+
 	int64_t start_time = k_uptime_get();
 	uint16_t collected = 0;
 
-	LOG_INF("ADXL343: Collecting %d samples at %d Hz...",
+	/* Timeout: max_samples / rate * 2 (generous headroom) */
+	const int64_t timeout_ms = ((int64_t)max_samples * 2000) / SAMPLE_RATE_HZ;
+
+	LOG_INF("ADXL343: Collecting %d samples at %d Hz (FIFO mode)...",
 		max_samples, SAMPLE_RATE_HZ);
 
-	for (uint16_t i = 0; i < max_samples; i++) {
-		/* Calculate target time for this sample */
-		int64_t target_us = (int64_t)i * sample_period_us;
-		int64_t elapsed_us = (k_uptime_get() - start_time) * 1000;
-		int64_t wait_us = target_us - elapsed_us;
+	while (collected < max_samples) {
 
-		if (wait_us > 0) {
-			k_usleep((int32_t)wait_us);
-		}
-
-		/* Burst read X, Y, Z (6 bytes, atomic) */
-		uint8_t data[6];
-		int err = adxl_burst_read(ADXL343_DATAX0, data, 6);
-		if (err) {
-			LOG_ERR("ADXL343: Read failed at sample %d (err %d)",
-				i, err);
+		/* Timeout guard */
+		if ((k_uptime_get() - start_time) > timeout_ms) {
+			LOG_ERR("ADXL343: Collection timeout at %d/%d samples",
+				collected, max_samples);
 			break;
 		}
 
-		buffer[i].x = (int16_t)((data[1] << 8) | data[0]);
-		buffer[i].y = (int16_t)((data[3] << 8) | data[2]);
-		buffer[i].z = (int16_t)((data[5] << 8) | data[4]);
-		collected++;
+		/* Read FIFO status — lower 6 bits = entries available */
+		uint8_t fifo_status;
+		int err = adxl_read_reg(ADXL343_FIFO_STATUS, &fifo_status);
+		if (err) {
+			LOG_ERR("ADXL343: FIFO status read failed (err %d)", err);
+			break;
+		}
+
+		uint8_t entries = fifo_status & 0x3F;
+
+		if (entries == 0) {
+			/* FIFO empty — sleep ~5 ms (8 samples at 1600 Hz) */
+			k_msleep(5);
+			continue;
+		}
+
+		/* Drain available entries, up to what buffer can hold */
+		uint16_t to_read = MIN((uint16_t)entries, max_samples - collected);
+
+		for (uint8_t j = 0; j < to_read; j++) {
+			uint8_t data[6];
+			err = adxl_burst_read(ADXL343_DATAX0, data, 6);
+			if (err) {
+				LOG_ERR("ADXL343: Read failed at sample %d (err %d)",
+					collected, err);
+				goto done;
+			}
+
+			buffer[collected].x = (int16_t)((data[1] << 8) | data[0]);
+			buffer[collected].y = (int16_t)((data[3] << 8) | data[2]);
+			buffer[collected].z = (int16_t)((data[5] << 8) | data[4]);
+			collected++;
+		}
 	}
 
+done:
 	int64_t duration_ms = k_uptime_get() - start_time;
-	LOG_INF("ADXL343: Collected %d samples in %lld ms", collected,
-		duration_ms);
+	LOG_INF("ADXL343: Collected %d samples in %lld ms "
+		"(%.1f Hz actual)",
+		collected, duration_ms,
+		collected ? (collected * 1000.0 / duration_ms) : 0.0);
 
 	return collected;
 }

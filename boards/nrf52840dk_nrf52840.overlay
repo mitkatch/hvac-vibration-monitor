@@ -1,5 +1,15 @@
-/* Step 5.2 - ADXL343 accelerometer on I2C */
-/* Using P0.26 (SDA) and P0.27 (SCL) */
+/*
+ * Device Tree Overlay for nRF52840 DK
+ * 
+ * Configures:
+ * - I2C0 for ADXL343 accelerometer (P0.26/P0.27)
+ * - LED0 alias for pairing indication
+ */
+
+/* ──────────────────────────────────────────────
+ * I2C Configuration for ADXL343 Accelerometer
+ * Using P0.26 (SDA) and P0.27 (SCL)
+ * ────────────────────────────────────────────── */
 &pinctrl {
 	i2c0_default: i2c0_default {
 		group1 {
@@ -29,5 +39,29 @@
 		compatible = "adi,adxl345";
 		reg = <0x53>;
 		status = "okay";
+	};
+
+	bme280: bme280@76 {
+		compatible = "bosch,bme280";
+		reg = <0x76>;
+		status = "okay";
+	};
+};
+
+/* ──────────────────────────────────────────────
+ * LED Configuration for Pairing Indication
+ * 
+ * nRF52840 DK has 4 built-in LEDs:
+ * - LED1: P0.13 (Active Low)
+ * - LED2: P0.14 (Active Low)
+ * - LED3: P0.15 (Active Low)
+ * - LED4: P0.16 (Active Low)
+ * 
+ * We just need to create an alias to led0 (LED1)
+ * since the nRF52840 DK already has LEDs defined.
+ * ────────────────────────────────────────────── */
+/ {
+	aliases {
+		led0 = &led0;  /* Map 'led0' alias to LED1 on nRF52840 DK */
 	};
 };
