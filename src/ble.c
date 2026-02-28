@@ -334,21 +334,31 @@ static struct bt_conn_auth_info_cb auth_info_callbacks = {
  * ────────────────────────────────────────────── */
 static void connected(struct bt_conn *conn, uint8_t err)
 {
-	if (err) {
-		LOG_ERR("BLE: Connection failed (err 0x%02x)", err);
-		return;
-	}
+    if (err) {
+        LOG_ERR("BLE: Connection failed (err 0x%02x)", err);
+        return;
+    }
 
-	LOG_INF("BLE: Connected");
+    LOG_INF("BLE: Connected");
+    current_conn = bt_conn_ref(conn);
+    notifications_enabled = false;
 
-	/* Take a reference — ble.c owns this */
-	current_conn = bt_conn_ref(conn);
-	notifications_enabled = false;
+    /* Request short supervision timeout so we detect dead connections quickly */
+    struct bt_le_conn_param param = {
+        .interval_min = 6,    /* 7.5ms */
+        .interval_max = 12,   /* 15ms */
+        .latency      = 0,
+        .timeout      = 100,  /* 1 second (units of 10ms) */
+    };
+    int param_err = bt_conn_le_param_update(conn, &param);
+    if (param_err) {
+        LOG_WRN("BLE: Failed to update conn params (err %d)", param_err);
+    }
 
-	if (post_event) {
-		fsm_event_t evt = { .type = EVT_BLE_CONNECTED };
-		post_event(&evt);
-	}
+    if (post_event) {
+        fsm_event_t evt = { .type = EVT_BLE_CONNECTED };
+        post_event(&evt);
+    }
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
