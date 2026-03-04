@@ -379,9 +379,20 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	}
 }
 
+static void le_param_updated(struct bt_conn *conn, uint16_t interval,
+			     uint16_t latency, uint16_t timeout)
+{
+	LOG_INF("BLE: Conn params updated — interval=%u (%.2f ms) "
+		"latency=%u timeout=%u (%u ms)",
+		interval, interval * 1.25,
+		latency,
+		timeout, timeout * 10);
+}
+
 BT_CONN_CB_DEFINE(conn_callbacks) = {
-	.connected    = connected,
-	.disconnected = disconnected,
+	.connected        = connected,
+	.disconnected     = disconnected,
+	.le_param_updated = le_param_updated,
 };
 
 /* ──────────────────────────────────────────────

@@ -80,6 +80,11 @@ typedef enum {
 	EVT_WATCHDOG_TIMEOUT,
 	EVT_RETRY_TIMEOUT,
 
+	/* Async collection pipeline events (NEW) */
+	EVT_VIBRATION_COLLECTED,       /* Vibration work item completed OK */
+	EVT_VIBRATION_FAILED,          /* Vibration work item failed */
+	EVT_ENV_COLLECTED,             /* Environment work item completed */
+
 	/* Transmission events */
 	EVT_BLE_TX_COMPLETE,
 	EVT_BLE_TX_FAILED,

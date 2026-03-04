@@ -1,8 +1,17 @@
 /*
  * fsm.c — Finite State Machine Implementation (Table-Driven)
  *
- * Elegant table-driven FSM using state-event transition table.
- * Much cleaner than the long if-else ladder.
+ * Async burst pipeline: each collection/TX stage yields back to
+ * the event loop so disconnect events are never missed.
+ *
+ * Pipeline:  CONNECTED_IDLE
+ *            → EVT_BURST_TIMER_EXPIRED  → COLLECTING_VIBRATION
+ *            → EVT_VIBRATION_COLLECTED  → COLLECTING_ENVIRONMENT (or skip)
+ *            → EVT_ENV_COLLECTED        → TRANSMITTING
+ *            → EVT_BLE_TX_COMPLETE      → CONNECTED_IDLE
+ *
+ * Between each arrow the event loop runs, giving EVT_BLE_DISCONNECTED
+ * a chance to be processed in whatever state the FSM is in.
  */
 
 #include <zephyr/kernel.h>
@@ -26,6 +35,9 @@ LOG_MODULE_REGISTER(fsm, LOG_LEVEL_INF);
 #define RETRY_MAX_ATTEMPTS      3
 #define EVENT_QUEUE_DEPTH       8
 #define PAIRING_TIMEOUT_SEC     120
+#define IDLE_NO_NOTIFY_MAX      3       /* Force disconnect after N consecutive
+                                         * burst skips with notifications off.
+                                         * At 10s burst interval = 30s timeout. */
 
 /* ──────────────────────────────────────────────
  * Event Queue
@@ -40,6 +52,62 @@ int event_post(fsm_event_t *evt)
 		LOG_ERR("Event queue full! Dropped event %d", evt->type);
 	}
 	return err;
+}
+
+/* ──────────────────────────────────────────────
+ * Work Items (for offloading blocking sensor I/O)
+ *
+ * sensor_collect_vibration() blocks ~320 ms — too long
+ * for an event handler.  We submit it to the system
+ * workqueue and post an event when it completes.
+ * ────────────────────────────────────────────── */
+static void vibration_work_handler(struct k_work *work);
+static void environment_work_handler(struct k_work *work);
+
+K_WORK_DEFINE(vibration_work, vibration_work_handler);
+K_WORK_DEFINE(environment_work, environment_work_handler);
+
+static void vibration_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	/* This runs on the system workqueue thread, NOT the FSM thread.
+	 * It only touches the vibration_buffer/count (owned by FSM, but
+	 * safe because the FSM is waiting in COLLECTING_VIBRATION and
+	 * won't touch them until it gets the completion event).            */
+	extern accel_sample_t vibration_buffer[];
+	extern uint16_t       vibration_count;
+
+	int ret = sensor_collect_vibration(vibration_buffer, VIBRATION_BURST_SIZE);
+
+	fsm_event_t evt;
+	if (ret > 0) {
+		vibration_count = ret;
+		evt.type = EVT_VIBRATION_COLLECTED;
+	} else {
+		evt.type = EVT_VIBRATION_FAILED;
+		evt.data.error_code = ret;
+	}
+	event_post(&evt);
+}
+
+static void environment_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	extern env_reading_t env_data;
+
+	int ret = sensor_collect_environment(&env_data);
+
+	fsm_event_t evt;
+	if (ret >= 0) {
+		evt.type = EVT_ENV_COLLECTED;
+	} else {
+		/* Non-fatal: we still move to TX, just without env data */
+		LOG_WRN("Env sensor read failed (%d), continuing without", ret);
+		evt.type = EVT_ENV_COLLECTED;
+	}
+	event_post(&evt);
 }
 
 /* ──────────────────────────────────────────────
@@ -157,11 +225,14 @@ static fsm_state_t current_state = STATE_INIT;
 static uint8_t     retry_count   = 0;
 static bool        is_connected     = false;
 static bool        is_authenticated = false;
+static uint8_t     idle_skip_count  = 0;     /* Consecutive burst skips (no notifications) */
 
-static accel_sample_t vibration_buffer[VIBRATION_BURST_SIZE];
-static uint16_t       vibration_count = 0;
-static env_reading_t  env_data;
-static bool           env_sensor_present = false;
+/* Sensor data buffers — written by work items, read by TX handler.
+ * Safe because only one pipeline stage runs at a time.             */
+accel_sample_t vibration_buffer[VIBRATION_BURST_SIZE];
+uint16_t       vibration_count = 0;
+env_reading_t  env_data;
+static bool    env_sensor_present = false;
 
 /* ──────────────────────────────────────────────
  * State Entry / Exit Actions
@@ -196,6 +267,7 @@ static void state_enter(fsm_state_t new_state)
 		break;
 	case STATE_CONNECTED_IDLE:
 		LOG_INF("→ CONNECTED_IDLE");
+		idle_skip_count = 0;
 		timer_start_burst();
 		break;
 	case STATE_COLLECTING_VIBRATION:
@@ -253,6 +325,9 @@ static void handle_pairing_complete(const fsm_event_t *evt);
 static void handle_pairing_failed(const fsm_event_t *evt);
 static void handle_pairing_timeout(const fsm_event_t *evt);
 static void handle_burst_timer(const fsm_event_t *evt);
+static void handle_vibration_collected(const fsm_event_t *evt);
+static void handle_vibration_failed(const fsm_event_t *evt);
+static void handle_env_collected(const fsm_event_t *evt);
 static void handle_disconnect_during_collection(const fsm_event_t *evt);
 static void handle_tx_disconnect(const fsm_event_t *evt);
 static void handle_tx_watchdog(const fsm_event_t *evt);
@@ -293,10 +368,13 @@ static const fsm_transition_t transition_table[] = {
 	{ STATE_CONNECTED_IDLE, EVT_BURST_TIMER_EXPIRED, handle_burst_timer },
 	{ STATE_CONNECTED_IDLE, EVT_BLE_DISCONNECTED,    handle_ble_disconnected },
 
-	/* STATE_COLLECTING_VIBRATION */
-	{ STATE_COLLECTING_VIBRATION, EVT_BLE_DISCONNECTED, handle_disconnect_during_collection },
+	/* STATE_COLLECTING_VIBRATION — async, work item running */
+	{ STATE_COLLECTING_VIBRATION, EVT_VIBRATION_COLLECTED, handle_vibration_collected },
+	{ STATE_COLLECTING_VIBRATION, EVT_VIBRATION_FAILED,    handle_vibration_failed },
+	{ STATE_COLLECTING_VIBRATION, EVT_BLE_DISCONNECTED,    handle_disconnect_during_collection },
 
-	/* STATE_COLLECTING_ENVIRONMENT */
+	/* STATE_COLLECTING_ENVIRONMENT — async, work item running */
+	{ STATE_COLLECTING_ENVIRONMENT, EVT_ENV_COLLECTED,    handle_env_collected },
 	{ STATE_COLLECTING_ENVIRONMENT, EVT_BLE_DISCONNECTED, handle_disconnect_during_collection },
 
 	/* STATE_TRANSMITTING */
@@ -340,7 +418,7 @@ static void fsm_process(const fsm_event_t *evt)
 
 /* ──────────────────────────────────────────────
  * Event Handler Implementations
- * 
+ *
  * Each handler is focused and clean - no nested if-else.
  * ────────────────────────────────────────────── */
 
@@ -360,7 +438,7 @@ static void handle_ble_ready(const fsm_event_t *evt)
 {
 	ARG_UNUSED(evt);
 	LOG_INF("BLE stack ready, starting advertising");
-	
+
 	int err = ble_start_advertising();
 	if (err) {
 		LOG_ERR("Initial advertising failed (%d)", err);
@@ -389,22 +467,22 @@ static void handle_pairing_request(const fsm_event_t *evt)
 {
 	ARG_UNUSED(evt);
 	timer_start_pairing_timeout();
-	
+
 	/* Start LED blinking - visual feedback that user needs to enter PIN */
 	led_start_blinking(500);  /* Blink every 500ms (1 Hz) */
-	
+
 	LOG_INF("Pairing requested - PIN displayed, waiting for user (120 sec timeout)");
 }
 
 static void handle_pairing_complete(const fsm_event_t *evt)
 {
 	timer_stop_pairing_timeout();
-	
+
 	/* Stop LED blinking - pairing successful */
 	led_stop_blinking();
-	
+
 	is_authenticated = true;
-	
+
 	if (evt->data.bonded) {
 		LOG_INF("✓ Pairing successful - device bonded");
 		LOG_INF("  Future connections will skip PIN entry");
@@ -417,10 +495,10 @@ static void handle_pairing_failed(const fsm_event_t *evt)
 {
 	ARG_UNUSED(evt);
 	timer_stop_pairing_timeout();
-	
+
 	/* Stop LED blinking - pairing failed */
 	led_stop_blinking();
-	
+
 	LOG_ERR("✗ Pairing failed - disconnecting");
 	transition(STATE_DISCONNECTED);
 }
@@ -428,24 +506,62 @@ static void handle_pairing_failed(const fsm_event_t *evt)
 static void handle_pairing_timeout(const fsm_event_t *evt)
 {
 	ARG_UNUSED(evt);
-	
+
 	/* Stop LED blinking - timeout */
 	led_stop_blinking();
-	
+
 	LOG_ERR("✗ Pairing timeout (120 sec) - disconnecting");
 	transition(STATE_DISCONNECTED);
 }
 
+/* ──────────────────────────────────────────────
+ * Async Burst Pipeline
+ *
+ * Stage 1: handle_burst_timer
+ *          - validates preconditions (notifications, auth)
+ *          - transitions to COLLECTING_VIBRATION
+ *          - submits blocking sensor read to system workqueue
+ *          - RETURNS immediately — event loop is free
+ *
+ * Stage 2: handle_vibration_collected
+ *          - data is in vibration_buffer/count
+ *          - if env sensor present → COLLECTING_ENVIRONMENT + work item
+ *          - else → skip straight to TRANSMITTING
+ *
+ * Stage 3: handle_env_collected
+ *          - transitions to TRANSMITTING
+ *          - starts TX (non-blocking BLE notify)
+ *
+ * Stage 4: handle_tx_complete / handle_tx_failed
+ *          - back to CONNECTED_IDLE or DISCONNECTED
+ *
+ * At every stage boundary the event loop runs, so
+ * EVT_BLE_DISCONNECTED is processed promptly.
+ * ────────────────────────────────────────────── */
+
+/* Stage 1 — kick off vibration collection */
 static void handle_burst_timer(const fsm_event_t *evt)
 {
 	ARG_UNUSED(evt);
 
 	/* Don't collect/transmit if notifications aren't enabled */
 	if (!ble_notifications_enabled()) {
-		LOG_INF("Notifications not enabled, skipping burst");
+		idle_skip_count++;
+		if (idle_skip_count >= IDLE_NO_NOTIFY_MAX) {
+			LOG_WRN("Notifications disabled for %u consecutive bursts "
+				"— connection likely dead, forcing disconnect",
+				idle_skip_count);
+			transition(STATE_DISCONNECTED);
+			return;
+		}
+		LOG_INF("Notifications not enabled, skipping burst (%u/%u)",
+			idle_skip_count, IDLE_NO_NOTIFY_MAX);
 		timer_start_burst();
 		return;
 	}
+
+	/* Notifications are live — reset skip counter */
+	idle_skip_count = 0;
 
 	/* SECURITY: Verify device is authenticated before transmitting data */
 #ifndef BLE_NO_PAIRING
@@ -458,39 +574,26 @@ static void handle_burst_timer(const fsm_event_t *evt)
 
 	transition(STATE_COLLECTING_VIBRATION);
 
-	/* Synchronous collection — ~320 ms */
-	int ret = sensor_collect_vibration(vibration_buffer, VIBRATION_BURST_SIZE);
-	if (ret > 0) {
-		vibration_count = ret;
-		
-		/* Collect environmental data if sensor present */
-		if (env_sensor_present) {
-			transition(STATE_COLLECTING_ENVIRONMENT);
-			int env_ret = sensor_collect_environment(&env_data);
-			if (env_ret < 0) {
-				LOG_WRN("Env sensor read failed (%d), continuing without", env_ret);
-			}
-		}
-		
-		/* Transmit collected data */
+	/* Submit blocking sensor read to system workqueue.
+	 * The work handler will post EVT_VIBRATION_COLLECTED or
+	 * EVT_VIBRATION_FAILED when done.                          */
+	k_work_submit(&vibration_work);
+}
+
+/* Stage 2 — vibration data ready, optionally collect environment */
+static void handle_vibration_collected(const fsm_event_t *evt)
+{
+	ARG_UNUSED(evt);
+	LOG_INF("Vibration collected (%u samples)", vibration_count);
+
+	if (env_sensor_present) {
+		transition(STATE_COLLECTING_ENVIRONMENT);
+		k_work_submit(&environment_work);
+	} else {
+		/* No env sensor — go straight to TX */
 		transition(STATE_TRANSMITTING);
-		
+
 		int tx_err = ble_transmit_burst(vibration_buffer, vibration_count);
-
-		/* Send environmental data after vibration burst */
-		if (tx_err == 0 && env_sensor_present) {
-			if (env_data.valid) {
-				int env_tx_err = ble_transmit_environment(&env_data);
-				if (env_tx_err < 0) {
-					LOG_WRN("Env TX failed (%d), continuing", env_tx_err);
-				}
-			} else {
-				LOG_WRN("Env data invalid, skipping TX");
-			}
-		} else if (!env_sensor_present) {
-			LOG_DBG("No env sensor — skipping env TX");
-		}
-
 		fsm_event_t tx_evt;
 		if (tx_err == 0) {
 			tx_evt.type = EVT_BLE_TX_COMPLETE;
@@ -499,16 +602,59 @@ static void handle_burst_timer(const fsm_event_t *evt)
 			tx_evt.data.error_code = tx_err;
 		}
 		event_post(&tx_evt);
-		
-	} else {
-		LOG_ERR("Vibration collection failed (%d)", ret);
-		transition(STATE_CONNECTED_IDLE);
 	}
 }
 
+/* Stage 2b — vibration collection failed */
+static void handle_vibration_failed(const fsm_event_t *evt)
+{
+	LOG_ERR("Vibration collection failed (err %d)", evt->data.error_code);
+	transition(STATE_CONNECTED_IDLE);
+}
+
+/* Stage 3 — environment data ready (or failed, non-fatal), start TX */
+static void handle_env_collected(const fsm_event_t *evt)
+{
+	ARG_UNUSED(evt);
+	LOG_INF("Environment data collected, starting TX");
+
+	transition(STATE_TRANSMITTING);
+
+	int tx_err = ble_transmit_burst(vibration_buffer, vibration_count);
+
+	/* Send environmental data after vibration burst */
+	if (tx_err == 0) {
+		if (env_data.valid) {
+			int env_tx_err = ble_transmit_environment(&env_data);
+			if (env_tx_err < 0) {
+				LOG_WRN("Env TX failed (%d), continuing", env_tx_err);
+			}
+		} else {
+			LOG_WRN("Env data invalid, skipping TX");
+		}
+	}
+
+	fsm_event_t tx_evt;
+	if (tx_err == 0) {
+		tx_evt.type = EVT_BLE_TX_COMPLETE;
+	} else {
+		tx_evt.type = EVT_BLE_TX_FAILED;
+		tx_evt.data.error_code = tx_err;
+	}
+	event_post(&tx_evt);
+}
+
+/* ──────────────────────────────────────────────
+ * Disconnect / TX Handlers (unchanged logic)
+ * ────────────────────────────────────────────── */
 static void handle_disconnect_during_collection(const fsm_event_t *evt)
 {
 	ARG_UNUSED(evt);
+	/* Work item may still be running on the system workqueue.
+	 * That's okay — when it posts EVT_VIBRATION_COLLECTED or
+	 * EVT_ENV_COLLECTED, we'll be in STATE_DISCONNECTED so the
+	 * event will be unhandled and harmlessly dropped.            */
+	LOG_WRN("Disconnect during collection — aborting pipeline");
 	transition(STATE_DISCONNECTED);
 }
 
@@ -541,11 +687,11 @@ static void handle_tx_failed(const fsm_event_t *evt)
 static void handle_cleanup_timeout(const fsm_event_t *evt)
 {
 	ARG_UNUSED(evt);
-	
+
 	/* Clear connection status flags */
 	is_connected = false;
 	is_authenticated = false;
-	
+
 	int err = ble_start_advertising();
 	if (err) {
 		LOG_ERR("Post-cleanup advertising failed (%d)", err);
@@ -572,7 +718,7 @@ static void handle_duplicate_disconnect(const fsm_event_t *evt)
 static void handle_retry_timeout(const fsm_event_t *evt)
 {
 	ARG_UNUSED(evt);
-	
+
 	retry_count++;
 	if (retry_count > RETRY_MAX_ATTEMPTS) {
 		LOG_ERR("Max retries exceeded");
@@ -604,7 +750,7 @@ static void handle_recovery_connect(const fsm_event_t *evt)
 void fsm_init(bool env_sensor_available)
 {
 	env_sensor_present = env_sensor_available;
-	LOG_INF("FSM initialized (env_sensor: %s)", 
+	LOG_INF("FSM initialized (env_sensor: %s)",
 		env_sensor_present ? "present" : "absent");
 }
 
