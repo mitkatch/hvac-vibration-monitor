@@ -25,9 +25,12 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/random/random.h>
+#include <zephyr/settings/settings.h>
 
 #include "ble.h"
 #include "fsm.h"
+#include "name_store.h"
 
 LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
 
@@ -41,6 +44,12 @@ static event_post_fn post_event = NULL;
  * ────────────────────────────────────────────── */
 static struct bt_conn *current_conn = NULL;
 static bool notifications_enabled = false;
+
+/* ──────────────────────────────────────────────
+ * Security and NUS state
+ * ────────────────────────────────────────────── */
+static uint32_t current_passkey = 0;
+static bool nus_tx_enabled = false;
 
 /* ──────────────────────────────────────────────
  * UUIDs
@@ -63,6 +72,109 @@ static const struct bt_uuid_128 vibration_char_uuid = BT_UUID_INIT_128(
 static const struct bt_uuid_128 env_char_uuid = BT_UUID_INIT_128(
 	0xf2, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
 	0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12);
+
+/* ──────────────────────────────────────────────
+ * Nordic UART Service (NUS) UUIDs
+ * 
+ * Standard Nordic service for serial communication.
+ * Used to display the random PIN to the user via
+ * nRF Connect app's UART terminal.
+ * ────────────────────────────────────────────── */
+
+/* NUS Service: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E */
+static const struct bt_uuid_128 nus_svc_uuid = BT_UUID_INIT_128(
+	0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0,
+	0x93, 0xF3, 0xA3, 0xB5, 0x01, 0x00, 0x40, 0x6E);
+
+/* NUS TX Char: 6E400003-B5A3-F393-E0A9-E50E24DCCA9E (device → phone) */
+static const struct bt_uuid_128 nus_tx_uuid = BT_UUID_INIT_128(
+	0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0,
+	0x93, 0xF3, 0xA3, 0xB5, 0x03, 0x00, 0x40, 0x6E);
+
+/* NUS RX Char: 6E400002-B5A3-F393-E0A9-E50E24DCCA9E (phone → device) */
+static const struct bt_uuid_128 nus_rx_uuid = BT_UUID_INIT_128(
+	0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0,
+	0x93, 0xF3, 0xA3, 0xB5, 0x02, 0x00, 0x40, 0x6E);
+
+/* ──────────────────────────────────────────────
+ * NUS TX CCC Changed Callback
+ * 
+ * Tracks when the UART terminal is opened/closed
+ * in nRF Connect app.
+ * ────────────────────────────────────────────── */
+static void nus_tx_ccc_changed(const struct bt_gatt_attr *attr,
+			       uint16_t value)
+{
+	nus_tx_enabled = (value == BT_GATT_CCC_NOTIFY);
+	LOG_INF("NUS: UART terminal %s",
+		nus_tx_enabled ? "opened" : "closed");
+}
+
+/* ──────────────────────────────────────────────
+ * NUS Response Helper (forward declaration —
+ * implementation after BT_GATT_SERVICE_DEFINE)
+ * ────────────────────────────────────────────── */
+static void _nus_respond(const char *msg);
+
+/* ──────────────────────────────────────────────
+ * NUS Command Prefix
+ * ────────────────────────────────────────────── */
+#define CMD_CHANGE_NAME  "CHANGE_NAME:"
+#define CMD_CHANGE_NAME_LEN  12  /* strlen("CHANGE_NAME:") */
+
+/* ──────────────────────────────────────────────
+ * NUS RX Write Callback
+ *
+ * Receives commands from gateway via UART service.
+ * Supported commands:
+ *   CHANGE_NAME:<new_name>  — set custom advertising name
+ *   CHANGE_NAME:            — revert to build default
+ * ────────────────────────────────────────────── */
+static ssize_t nus_rx_write(struct bt_conn *conn,
+			    const struct bt_gatt_attr *attr,
+			    const void *buf, uint16_t len,
+			    uint16_t offset, uint8_t flags)
+{
+	/* Null-terminate for safe string ops */
+	char cmd[NAME_STORE_MAX_LEN + CMD_CHANGE_NAME_LEN + 1];
+	uint16_t copy_len = (len < sizeof(cmd) - 1) ? len : sizeof(cmd) - 1;
+	memcpy(cmd, buf, copy_len);
+	cmd[copy_len] = '\0';
+
+	/* Strip trailing \r\n if present */
+	while (copy_len > 0 && (cmd[copy_len - 1] == '\r' ||
+				cmd[copy_len - 1] == '\n')) {
+		cmd[--copy_len] = '\0';
+	}
+
+	LOG_INF("NUS RX: \"%s\" (%u bytes)", cmd, len);
+
+	/* Parse CHANGE_NAME command */
+	if (strncmp(cmd, CMD_CHANGE_NAME, CMD_CHANGE_NAME_LEN) == 0) {
+		const char *new_name = cmd + CMD_CHANGE_NAME_LEN;
+
+		int err = name_store_set(new_name);
+		if (err == -EINVAL) {
+			LOG_ERR("NUS: Name rejected (non-ASCII characters)");
+			_nus_respond("ERR:INVALID_NAME\r\n");
+		} else if (err) {
+			LOG_ERR("NUS: Name save failed (err %d)", err);
+			_nus_respond("ERR:SAVE_FAILED\r\n");
+		} else {
+			LOG_INF("NUS: Name accepted: \"%s\"", name_store_get());
+			/* Respond with confirmation */
+			char resp[NAME_STORE_MAX_LEN + 16];
+			int resp_len = snprintk(resp, sizeof(resp),
+						"OK:NAME=%s\r\n",
+						name_store_get());
+			_nus_respond(resp);
+		}
+	} else {
+		LOG_DBG("NUS: Unknown command, ignored");
+	}
+
+	return len;
+}
 
 /* ──────────────────────────────────────────────
  * CCC Changed Callback
@@ -97,6 +209,56 @@ static void env_ccc_changed(const struct bt_gatt_attr *attr,
 }
 
 /* ──────────────────────────────────────────────
+ * Nordic UART Service Definition
+ * 
+ * This service allows displaying text to the user
+ * via nRF Connect app. Used for showing the random
+ * pairing PIN.
+ * ────────────────────────────────────────────── */
+BT_GATT_SERVICE_DEFINE(nus_svc,
+	BT_GATT_PRIMARY_SERVICE(&nus_svc_uuid),
+
+	/* TX characteristic (device → phone) */
+	BT_GATT_CHARACTERISTIC(&nus_tx_uuid.uuid,
+			       BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_NONE,
+			       NULL, NULL, NULL),
+	BT_GATT_CCC(nus_tx_ccc_changed,
+#ifdef BLE_NO_PAIRING
+		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+#else
+		    BT_GATT_PERM_READ_AUTHEN | BT_GATT_PERM_WRITE_AUTHEN),
+#endif
+
+	/* RX characteristic (phone → device) */
+	BT_GATT_CHARACTERISTIC(&nus_rx_uuid.uuid,
+			       BT_GATT_CHRC_WRITE |
+			       BT_GATT_CHRC_WRITE_WITHOUT_RESP,
+#ifdef BLE_NO_PAIRING
+			       BT_GATT_PERM_WRITE,
+#else
+			       BT_GATT_PERM_WRITE_AUTHEN,
+#endif
+			       NULL, nus_rx_write, NULL),
+);
+
+
+/* ──────────────────────────────────────────────
+ * NUS Response Helper (implementation)
+ * ────────────────────────────────────────────── */
+static void _nus_respond(const char *msg)
+{
+	if (!nus_tx_enabled || !current_conn) {
+		return;
+	}
+	int err = bt_gatt_notify(current_conn, &nus_svc.attrs[2],
+				 msg, strlen(msg));
+	if (err) {
+		LOG_WRN("NUS: Failed to send response (err %d)", err);
+	}
+}
+
+/* ──────────────────────────────────────────────
  * GATT Service Definition
  * ────────────────────────────────────────────── */
 BT_GATT_SERVICE_DEFINE(vibration_svc,
@@ -109,7 +271,11 @@ BT_GATT_SERVICE_DEFINE(vibration_svc,
 			       BT_GATT_PERM_NONE,
 			       NULL, NULL, NULL),
 	BT_GATT_CCC(vibration_ccc_changed,
+#ifdef BLE_NO_PAIRING
 		     BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+#else
+		     BT_GATT_PERM_READ_AUTHEN | BT_GATT_PERM_WRITE_AUTHEN),
+#endif
 
 	/* Environment data characteristic (notify only) */
 	BT_GATT_CHARACTERISTIC(&env_char_uuid.uuid,
@@ -117,8 +283,115 @@ BT_GATT_SERVICE_DEFINE(vibration_svc,
 			       BT_GATT_PERM_NONE,
 			       NULL, NULL, NULL),
 	BT_GATT_CCC(env_ccc_changed,
+#ifdef BLE_NO_PAIRING
 		     BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+#else
+		     BT_GATT_PERM_READ_AUTHEN | BT_GATT_PERM_WRITE_AUTHEN),
+#endif
 );
+
+/* ──────────────────────────────────────────────
+ * Security Callbacks
+ * 
+ * Handle pairing, passkey display, authentication,
+ * and bonding events.
+ * ────────────────────────────────────────────── */
+
+static void auth_passkey_confirm(struct bt_conn *conn, unsigned int passkey)
+{
+	/* Some platforms (like Windows) need explicit confirmation
+	 * Auto-confirm since we're displaying the passkey */
+	LOG_INF("Passkey confirm request: %06u (auto-confirming)", passkey);
+	bt_conn_auth_passkey_confirm(conn);
+}
+
+static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
+{
+	LOG_INF("═══════════════════════════════════");
+	LOG_INF("  PAIRING PIN: %06u", passkey);
+	LOG_INF("═══════════════════════════════════");
+
+	/* Store for validation */
+	current_passkey = passkey;
+
+	/* Send PIN to NUS UART terminal
+	 * Keep message simple and clear for nRF Connect display */
+	char pin_msg[64];
+	int len = snprintk(pin_msg, sizeof(pin_msg),
+		"PIN: %06u\r\n", passkey);
+
+	/* Try to send immediately if NUS is enabled */
+	if (nus_tx_enabled && current_conn) {
+		int err = bt_gatt_notify(current_conn, &nus_svc.attrs[2],
+				         pin_msg, len);
+		if (err) {
+			LOG_WRN("Failed to send PIN via NUS (err %d)", err);
+		} else {
+			LOG_INF("PIN sent via NUS");
+		}
+	} else {
+		LOG_WRN("NUS not enabled yet - PIN only visible in logs");
+		LOG_INF("Enable notifications on Nordic UART Service TX to see PIN");
+	}
+
+	/* Post event to FSM */
+	if (post_event) {
+		fsm_event_t evt = {
+			.type = EVT_PAIRING_REQUEST,
+			.data.passkey = passkey,
+		};
+		post_event(&evt);
+	}
+}
+
+static void auth_cancel(struct bt_conn *conn)
+{
+	LOG_WRN("Pairing cancelled");
+	
+	if (post_event) {
+		fsm_event_t evt = { .type = EVT_PAIRING_FAILED };
+		post_event(&evt);
+	}
+}
+
+static void pairing_complete(struct bt_conn *conn, bool bonded)
+{
+	LOG_INF("Pairing %s (bonded: %s)",
+		bonded ? "successful" : "completed",
+		bonded ? "yes" : "no");
+
+	if (post_event) {
+		fsm_event_t evt = {
+			.type = EVT_PAIRING_COMPLETE,
+			.data.bonded = bonded,
+		};
+		post_event(&evt);
+	}
+}
+
+static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
+{
+	LOG_ERR("Pairing failed: %d", reason);
+
+	if (post_event) {
+		fsm_event_t evt = {
+			.type = EVT_PAIRING_FAILED,
+			.data.security_error = reason,
+		};
+		post_event(&evt);
+	}
+}
+
+static struct bt_conn_auth_cb auth_callbacks = {
+	.passkey_display = auth_passkey_display,
+	.passkey_confirm = auth_passkey_confirm,
+	.cancel = auth_cancel,
+};
+
+static struct bt_conn_auth_info_cb auth_info_callbacks = {
+	.pairing_complete = pairing_complete,
+	.pairing_failed = pairing_failed,
+};
 
 /* ──────────────────────────────────────────────
  * Connection Callbacks
@@ -129,21 +402,31 @@ BT_GATT_SERVICE_DEFINE(vibration_svc,
  * ────────────────────────────────────────────── */
 static void connected(struct bt_conn *conn, uint8_t err)
 {
-	if (err) {
-		LOG_ERR("BLE: Connection failed (err 0x%02x)", err);
-		return;
-	}
+    if (err) {
+        LOG_ERR("BLE: Connection failed (err 0x%02x)", err);
+        return;
+    }
 
-	LOG_INF("BLE: Connected");
+    LOG_INF("BLE: Connected");
+    current_conn = bt_conn_ref(conn);
+    notifications_enabled = false;
 
-	/* Take a reference — ble.c owns this */
-	current_conn = bt_conn_ref(conn);
-	notifications_enabled = false;
+    /* Request short supervision timeout so we detect dead connections quickly */
+    struct bt_le_conn_param param = {
+        .interval_min = 6,    /* 7.5ms */
+        .interval_max = 12,   /* 15ms */
+        .latency      = 0,
+        .timeout      = 100,  /* 1 second (units of 10ms) */
+    };
+    int param_err = bt_conn_le_param_update(conn, &param);
+    if (param_err) {
+        LOG_WRN("BLE: Failed to update conn params (err %d)", param_err);
+    }
 
-	if (post_event) {
-		fsm_event_t evt = { .type = EVT_BLE_CONNECTED };
-		post_event(&evt);
-	}
+    if (post_event) {
+        fsm_event_t evt = { .type = EVT_BLE_CONNECTED };
+        post_event(&evt);
+    }
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -164,13 +447,28 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	}
 }
 
+static void le_param_updated(struct bt_conn *conn, uint16_t interval,
+			     uint16_t latency, uint16_t timeout)
+{
+	LOG_INF("BLE: Conn params updated — interval=%u (%.2f ms) "
+		"latency=%u timeout=%u (%u ms)",
+		interval, interval * 1.25,
+		latency,
+		timeout, timeout * 10);
+}
+
 BT_CONN_CB_DEFINE(conn_callbacks) = {
-	.connected    = connected,
-	.disconnected = disconnected,
+	.connected        = connected,
+	.disconnected     = disconnected,
+	.le_param_updated = le_param_updated,
 };
 
 /* ──────────────────────────────────────────────
  * Advertising Data
+ *
+ * ad[] is static (flags + UUID don't change).
+ * sd[] (scan response with name) is rebuilt each
+ * time advertising starts, using name_store_get().
  * ────────────────────────────────────────────── */
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS,
@@ -180,11 +478,46 @@ static const struct bt_data ad[] = {
 		      0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12),
 };
 
-static const struct bt_data sd[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE,
-		CONFIG_BT_DEVICE_NAME,
-		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
-};
+/* Mutable scan response — updated by ble_start_advertising() */
+static struct bt_data sd[1];
+
+/* ──────────────────────────────────────────────
+ * BLE Ready Callback
+ * 
+ * Called when BLE stack is ready (after settings loaded).
+ * Required when CONFIG_BT_SETTINGS=y is enabled.
+ * 
+ * This posts an event to the FSM rather than blocking.
+ * ────────────────────────────────────────────── */
+static void bt_ready_callback(int err)
+{
+	if (err) {
+		LOG_ERR("BLE: bt_ready failed (err %d)", err);
+		if (post_event) {
+			fsm_event_t evt = {
+				.type = EVT_INIT_FAILED,
+				.data.error_code = err,
+			};
+			post_event(&evt);
+		}
+		return;
+	}
+
+	LOG_INF("BLE: Stack ready, loading settings...");
+	
+	/* Load settings from flash (bonds, etc.) */
+	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
+		settings_load();
+	}
+	
+	LOG_INF("BLE: Settings loaded, stack ready");
+	
+	/* Post event to FSM that BLE is ready */
+	if (post_event) {
+		fsm_event_t evt = { .type = EVT_BLE_READY };
+		post_event(&evt);
+	}
+}
 
 /* ──────────────────────────────────────────────
  * Public API — called by FSM from main thread
@@ -196,19 +529,57 @@ int ble_init(event_post_fn callback)
 
 	post_event = callback;
 
-	err = bt_enable(NULL);
+	/* Initialize settings subsystem first (required for bonding) */
+	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
+		err = settings_subsys_init();
+		if (err) {
+			LOG_ERR("BLE: Settings subsystem init failed (err %d)", err);
+			return err;
+		}
+		LOG_INF("BLE: Settings subsystem initialized");
+	}
+
+	/* Initialize name store — sets default, will be updated
+	 * when settings_load() fires in bt_ready_callback()    */
+	name_store_init();
+
+	/* Enable BLE stack - settings will load asynchronously */
+	err = bt_enable(bt_ready_callback);
 	if (err) {
 		LOG_ERR("BLE: bt_enable failed (err %d)", err);
 		return err;
 	}
 
-	LOG_INF("BLE: Stack initialized");
+#ifndef BLE_NO_PAIRING
+	/* Register security callbacks for pairing/bonding */
+	err = bt_conn_auth_cb_register(&auth_callbacks);
+	if (err) {
+		LOG_ERR("BLE: Failed to register auth callbacks (err %d)", err);
+		return err;
+	}
+
+	err = bt_conn_auth_info_cb_register(&auth_info_callbacks);
+	if (err) {
+		LOG_ERR("BLE: Failed to register auth info callbacks (err %d)", err);
+		return err;
+	}
+#else
+	LOG_WRN("BLE: Pairing DISABLED (BLE_NO_PAIRING) — open access for testing");
+#endif
+
+	LOG_INF("BLE: Stack initializing (waiting for settings to load)...");
 	return 0;
 }
 
 int ble_start_advertising(void)
 {
 	int err;
+
+	/* Build scan response with current name */
+	const char *name = name_store_get();
+	sd[0].type     = BT_DATA_NAME_COMPLETE;
+	sd[0].data_len = strlen(name);
+	sd[0].data     = (const uint8_t *)name;
 
 	struct bt_le_adv_param adv_param = {
 		.id = BT_ID_DEFAULT,
@@ -227,7 +598,8 @@ int ble_start_advertising(void)
 		return err;
 	}
 
-	LOG_INF("BLE: Advertising started (%s)", CONFIG_BT_DEVICE_NAME);
+	LOG_INF("BLE: Advertising started (\"%s\"%s)", name,
+		name_store_is_custom() ? " [custom]" : "");
 	return 0;
 }
 
@@ -261,6 +633,8 @@ void ble_cleanup(void)
 		current_conn = NULL;
 	}
 	notifications_enabled = false;
+	nus_tx_enabled = false;
+	current_passkey = 0;
 
 	LOG_INF("BLE: Cleanup complete (disconnected, conn unref, state reset)");
 }
@@ -410,4 +784,58 @@ int ble_transmit_environment(const env_reading_t *reading)
 		reading->pressure);
 
 	return 0;
+}
+
+/* ──────────────────────────────────────────────
+ * Security Helper Functions
+ * ────────────────────────────────────────────── */
+
+int ble_set_security(void)
+{
+#ifdef BLE_NO_PAIRING
+	LOG_WRN("BLE: ble_set_security() skipped (BLE_NO_PAIRING)");
+	return 0;
+#else
+	if (!current_conn) {
+		return -ENOTCONN;
+	}
+
+	/* Request Security Level 3: Authenticated pairing (MITM protection) */
+	int err = bt_conn_set_security(current_conn, BT_SECURITY_L3);
+	if (err) {
+		LOG_ERR("BLE: Failed to set security level (err %d)", err);
+		return err;
+	}
+
+	LOG_INF("BLE: Security level 3 requested (authenticated pairing)");
+	return 0;
+#endif
+}
+
+bool ble_is_authenticated(void)
+{
+	if (!current_conn) {
+		return false;
+	}
+
+	struct bt_conn_info info;
+	int err = bt_conn_get_info(current_conn, &info);
+	if (err) {
+		return false;
+	}
+
+	/* Check if security level is at least L3 (authenticated) */
+	return (info.security.level >= BT_SECURITY_L3);
+}
+
+int ble_delete_all_bonds(void)
+{
+	LOG_INF("BLE: Deleting all bonds...");
+	
+	/* This requires settings subsystem enabled */
+	/* Implementation will iterate and delete all stored bonds */
+	/* For now, just log - full implementation needs settings API */
+	
+	LOG_WRN("BLE: Bond deletion not yet implemented");
+	return -ENOTSUP;
 }
