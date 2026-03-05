@@ -14,6 +14,7 @@ target_sources(app PRIVATE
     src/sensor_bme280.c
     src/fsm.c
     src/led.c
+    src/name_store.c
     # src/sensor_piezo.c    # uncomment when hardware ready
     # src/analysis.c        # uncomment when on-device analysis needed
 )

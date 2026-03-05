@@ -30,6 +30,7 @@
 
 #include "ble.h"
 #include "fsm.h"
+#include "name_store.h"
 
 LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
 
@@ -110,18 +111,69 @@ static void nus_tx_ccc_changed(const struct bt_gatt_attr *attr,
 }
 
 /* ──────────────────────────────────────────────
+ * NUS Response Helper (forward declaration —
+ * implementation after BT_GATT_SERVICE_DEFINE)
+ * ────────────────────────────────────────────── */
+static void _nus_respond(const char *msg);
+
+/* ──────────────────────────────────────────────
+ * NUS Command Prefix
+ * ────────────────────────────────────────────── */
+#define CMD_CHANGE_NAME  "CHANGE_NAME:"
+#define CMD_CHANGE_NAME_LEN  12  /* strlen("CHANGE_NAME:") */
+
+/* ──────────────────────────────────────────────
  * NUS RX Write Callback
- * 
- * Receives data from phone (currently unused,
- * but required for NUS specification).
+ *
+ * Receives commands from gateway via UART service.
+ * Supported commands:
+ *   CHANGE_NAME:<new_name>  — set custom advertising name
+ *   CHANGE_NAME:            — revert to build default
  * ────────────────────────────────────────────── */
 static ssize_t nus_rx_write(struct bt_conn *conn,
 			    const struct bt_gatt_attr *attr,
 			    const void *buf, uint16_t len,
 			    uint16_t offset, uint8_t flags)
 {
-	LOG_DBG("NUS: RX %d bytes (ignored)", len);
-	return len;  /* Accept but don't process */
+	/* Null-terminate for safe string ops */
+	char cmd[NAME_STORE_MAX_LEN + CMD_CHANGE_NAME_LEN + 1];
+	uint16_t copy_len = (len < sizeof(cmd) - 1) ? len : sizeof(cmd) - 1;
+	memcpy(cmd, buf, copy_len);
+	cmd[copy_len] = '\0';
+
+	/* Strip trailing \r\n if present */
+	while (copy_len > 0 && (cmd[copy_len - 1] == '\r' ||
+				cmd[copy_len - 1] == '\n')) {
+		cmd[--copy_len] = '\0';
+	}
+
+	LOG_INF("NUS RX: \"%s\" (%u bytes)", cmd, len);
+
+	/* Parse CHANGE_NAME command */
+	if (strncmp(cmd, CMD_CHANGE_NAME, CMD_CHANGE_NAME_LEN) == 0) {
+		const char *new_name = cmd + CMD_CHANGE_NAME_LEN;
+
+		int err = name_store_set(new_name);
+		if (err == -EINVAL) {
+			LOG_ERR("NUS: Name rejected (non-ASCII characters)");
+			_nus_respond("ERR:INVALID_NAME\r\n");
+		} else if (err) {
+			LOG_ERR("NUS: Name save failed (err %d)", err);
+			_nus_respond("ERR:SAVE_FAILED\r\n");
+		} else {
+			LOG_INF("NUS: Name accepted: \"%s\"", name_store_get());
+			/* Respond with confirmation */
+			char resp[NAME_STORE_MAX_LEN + 16];
+			int resp_len = snprintk(resp, sizeof(resp),
+						"OK:NAME=%s\r\n",
+						name_store_get());
+			_nus_respond(resp);
+		}
+	} else {
+		LOG_DBG("NUS: Unknown command, ignored");
+	}
+
+	return len;
 }
 
 /* ──────────────────────────────────────────────
@@ -189,6 +241,22 @@ BT_GATT_SERVICE_DEFINE(nus_svc,
 #endif
 			       NULL, nus_rx_write, NULL),
 );
+
+
+/* ──────────────────────────────────────────────
+ * NUS Response Helper (implementation)
+ * ────────────────────────────────────────────── */
+static void _nus_respond(const char *msg)
+{
+	if (!nus_tx_enabled || !current_conn) {
+		return;
+	}
+	int err = bt_gatt_notify(current_conn, &nus_svc.attrs[2],
+				 msg, strlen(msg));
+	if (err) {
+		LOG_WRN("NUS: Failed to send response (err %d)", err);
+	}
+}
 
 /* ──────────────────────────────────────────────
  * GATT Service Definition
@@ -397,6 +465,10 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 
 /* ──────────────────────────────────────────────
  * Advertising Data
+ *
+ * ad[] is static (flags + UUID don't change).
+ * sd[] (scan response with name) is rebuilt each
+ * time advertising starts, using name_store_get().
  * ────────────────────────────────────────────── */
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS,
@@ -406,11 +478,8 @@ static const struct bt_data ad[] = {
 		      0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12),
 };
 
-static const struct bt_data sd[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE,
-		CONFIG_BT_DEVICE_NAME,
-		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
-};
+/* Mutable scan response — updated by ble_start_advertising() */
+static struct bt_data sd[1];
 
 /* ──────────────────────────────────────────────
  * BLE Ready Callback
@@ -470,6 +539,10 @@ int ble_init(event_post_fn callback)
 		LOG_INF("BLE: Settings subsystem initialized");
 	}
 
+	/* Initialize name store — sets default, will be updated
+	 * when settings_load() fires in bt_ready_callback()    */
+	name_store_init();
+
 	/* Enable BLE stack - settings will load asynchronously */
 	err = bt_enable(bt_ready_callback);
 	if (err) {
@@ -502,6 +575,12 @@ int ble_start_advertising(void)
 {
 	int err;
 
+	/* Build scan response with current name */
+	const char *name = name_store_get();
+	sd[0].type     = BT_DATA_NAME_COMPLETE;
+	sd[0].data_len = strlen(name);
+	sd[0].data     = (const uint8_t *)name;
+
 	struct bt_le_adv_param adv_param = {
 		.id = BT_ID_DEFAULT,
 		.sid = 0,
@@ -519,7 +598,8 @@ int ble_start_advertising(void)
 		return err;
 	}
 
-	LOG_INF("BLE: Advertising started (%s)", CONFIG_BT_DEVICE_NAME);
+	LOG_INF("BLE: Advertising started (\"%s\"%s)", name,
+		name_store_is_custom() ? " [custom]" : "");
 	return 0;
 }
 
