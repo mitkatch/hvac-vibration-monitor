@@ -27,9 +27,12 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/random/random.h>
 #include <zephyr/settings/settings.h>
+#include <stdlib.h>   /* abs() */
+#include <string.h>   /* memcpy() */
 
 #include "ble.h"
 #include "fsm.h"
+#include "analysis.h"
 #include "name_store.h"
 
 LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
@@ -650,139 +653,235 @@ bool ble_notifications_enabled(void)
 }
 
 /* ──────────────────────────────────────────────
- * Burst Transmission
- *
- * Sends vibration data as a sequence of BLE
- * notification packets. Called synchronously
- * by the FSM in TRANSMITTING state.
- *
- * Returns:
- *   0       on success (all packets sent)
- *   -ENOTCONN  if connection lost
- *   -ENOMEM    if TX buffer exhausted after retries
- *   other   BLE stack error
+ * TX Shared Constants and Helper
  * ────────────────────────────────────────────── */
 #define MAX_PAYLOAD         244
 #define ENOMEM_RETRY_MAX    3
 #define ENOMEM_RETRY_MS     50
 #define INTER_PACKET_MS     10
 
-int ble_transmit_burst(const accel_sample_t *buffer, uint16_t count)
+/* Encode the 8-byte burst_header_t into buf (little-endian) */
+static void encode_header(uint8_t *buf, uint8_t type, uint16_t seq,
+			  uint16_t count, uint16_t chunk_index)
 {
-	if (!current_conn) {
-		return -ENOTCONN;
+	buf[0] = type;
+	buf[1] = 0x00;
+	buf[2] = (uint8_t)(seq & 0xFF);
+	buf[3] = (uint8_t)(seq >> 8);
+	buf[4] = (uint8_t)(count & 0xFF);
+	buf[5] = (uint8_t)(count >> 8);
+	buf[6] = (uint8_t)(chunk_index & 0xFF);
+	buf[7] = (uint8_t)(chunk_index >> 8);
+}
+
+/* Single notification with bounded ENOMEM retry */
+static int notify_with_retry(const struct bt_gatt_attr *attr,
+			     const void *data, uint16_t len)
+{
+	for (int retry = 0; retry <= ENOMEM_RETRY_MAX; retry++) {
+		int err = bt_gatt_notify(current_conn, attr, data, len);
+		if (err == 0) return 0;
+		if (err == -ENOMEM && retry < ENOMEM_RETRY_MAX) {
+			k_msleep(ENOMEM_RETRY_MS);
+			continue;
+		}
+		return err;
+	}
+	return -ENOMEM;
+}
+
+/* ──────────────────────────────────────────────
+ * ble_transmit_stats — time-domain feature packet
+ *
+ * Wire: header (8) + time_stats_t (36) = 44 bytes, single notification.
+ * PKT_TYPE_TIME_STATS.
+ * ────────────────────────────────────────────── */
+int ble_transmit_stats(uint16_t seq, uint16_t count,
+		       const time_stats_t *stats)
+{
+	if (!current_conn) return -ENOTCONN;
+	if (!stats)        return -EINVAL;
+
+	uint8_t pkt[8 + 36];
+	encode_header(pkt, PKT_TYPE_TIME_STATS, seq, count, 0);
+
+	uint8_t *p = pkt + 8;
+	/* rms */
+	p[0]=stats->rms_x&0xFF;  p[1]=stats->rms_x>>8;
+	p[2]=stats->rms_y&0xFF;  p[3]=stats->rms_y>>8;
+	p[4]=stats->rms_z&0xFF;  p[5]=stats->rms_z>>8;
+	/* peak (signed — cast via uint16_t to avoid sign-extension warnings) */
+	p[6]=(uint8_t)((uint16_t)stats->peak_x&0xFF);  p[7]=(uint8_t)((uint16_t)stats->peak_x>>8);
+	p[8]=(uint8_t)((uint16_t)stats->peak_y&0xFF);  p[9]=(uint8_t)((uint16_t)stats->peak_y>>8);
+	p[10]=(uint8_t)((uint16_t)stats->peak_z&0xFF); p[11]=(uint8_t)((uint16_t)stats->peak_z>>8);
+	/* crest */
+	p[12]=stats->crest_x&0xFF; p[13]=stats->crest_x>>8;
+	p[14]=stats->crest_y&0xFF; p[15]=stats->crest_y>>8;
+	p[16]=stats->crest_z&0xFF; p[17]=stats->crest_z>>8;
+	/* kurtosis (signed) */
+	p[18]=(uint8_t)((uint16_t)stats->kurtosis_x&0xFF); p[19]=(uint8_t)((uint16_t)stats->kurtosis_x>>8);
+	p[20]=(uint8_t)((uint16_t)stats->kurtosis_y&0xFF); p[21]=(uint8_t)((uint16_t)stats->kurtosis_y>>8);
+	p[22]=(uint8_t)((uint16_t)stats->kurtosis_z&0xFF); p[23]=(uint8_t)((uint16_t)stats->kurtosis_z>>8);
+	/* variance */
+	p[24]=stats->variance_x&0xFF; p[25]=stats->variance_x>>8;
+	p[26]=stats->variance_y&0xFF; p[27]=stats->variance_y>>8;
+	p[28]=stats->variance_z&0xFF; p[29]=stats->variance_z>>8;
+	/* reserved + sample_count */
+	p[30]=0; p[31]=0;
+	p[32]=(uint8_t)(stats->sample_count&0xFF);
+	p[33]=(uint8_t)((stats->sample_count>>8)&0xFF);
+	p[34]=(uint8_t)((stats->sample_count>>16)&0xFF);
+	p[35]=(uint8_t)((stats->sample_count>>24)&0xFF);
+
+	int err = notify_with_retry(&vibration_svc.attrs[2], pkt, sizeof(pkt));
+	if (err) {
+		LOG_ERR("BLE TX: time stats failed (err %d)", err);
+		return err;
 	}
 
-	const uint16_t total_bytes = count * sizeof(accel_sample_t);
-	const uint16_t num_packets = (total_bytes + MAX_PAYLOAD - 1) / MAX_PAYLOAD;
-
-	LOG_INF("BLE TX: %d samples, %d bytes, %d packets",
-		count, total_bytes, num_packets);
-
-	uint16_t offset = 0;
-
-	for (uint16_t i = 0; i < num_packets; i++) {
-
-		/* Check connection is still alive before each packet */
-		if (!current_conn) {
-			LOG_WRN("BLE TX: Connection lost at packet %d/%d",
-				i, num_packets);
-			return -ENOTCONN;
-		}
-
-		uint16_t remaining = total_bytes - offset;
-		uint16_t chunk = (remaining > MAX_PAYLOAD) ?
-				 MAX_PAYLOAD : remaining;
-
-		/* Attempt to send with bounded retries for ENOMEM */
-		int err = -1;
-		for (int retry = 0; retry <= ENOMEM_RETRY_MAX; retry++) {
-
-			err = bt_gatt_notify(current_conn,
-					     &vibration_svc.attrs[2],
-					     (const uint8_t *)buffer + offset,
-					     chunk);
-
-			if (err == 0) {
-				break;  /* success */
-			}
-
-			if (err == -ENOMEM && retry < ENOMEM_RETRY_MAX) {
-				/* TX buffer full — wait and retry */
-				LOG_DBG("BLE TX: Buffer full on pkt %d, "
-					"retry %d/%d",
-					i, retry + 1, ENOMEM_RETRY_MAX);
-				k_msleep(ENOMEM_RETRY_MS);
-				continue;
-			}
-
-			/* Non-retryable error or retries exhausted */
-			LOG_ERR("BLE TX: Failed on pkt %d/%d (err %d)",
-				i, num_packets, err);
-			return err;
-		}
-
-		offset += chunk;
-
-		/* Progress logging */
-		if ((i + 1) % 5 == 0 || i == num_packets - 1) {
-			LOG_INF("BLE TX: %d/%d packets sent", i + 1,
-				num_packets);
-		}
-
-		/* Inter-packet pacing */
-		if (i < num_packets - 1) {
-			k_msleep(INTER_PACKET_MS);
-		}
-	}
-
-	LOG_INF("BLE TX: Burst complete");
+	LOG_INF("BLE TX: time stats seq=%u rms=[%u,%u,%u]mg "
+		"crest=[%u,%u,%u] kurt=[%d,%d,%d]/100",
+		seq,
+		stats->rms_x, stats->rms_y, stats->rms_z,
+		stats->crest_x, stats->crest_y, stats->crest_z,
+		stats->kurtosis_x, stats->kurtosis_y, stats->kurtosis_z);
 	return 0;
 }
 
 /* ──────────────────────────────────────────────
- * Environment Data Transmission
+ * ble_transmit_fft_stats — FFT feature packet
  *
- * Much smaller than vibration — single packet.
+ * Wire: header (8) + fft_stats_t (60) = 68 bytes, single notification.
+ * PKT_TYPE_FFT_STATS.
  * ────────────────────────────────────────────── */
-int ble_transmit_environment(const env_reading_t *reading)
+static void encode_axis_fft(uint8_t *p, const axis_fft_stats_t *a)
 {
-	if (!current_conn) {
-		return -ENOTCONN;
-	}
+	p[0] =(uint8_t)(a->dom_freq_hz&0xFF); p[1] =(uint8_t)(a->dom_freq_hz>>8);
+	p[2] =(uint8_t)(a->dom_mag&0xFF);     p[3] =(uint8_t)(a->dom_mag>>8);
+	p[4] =(uint8_t)(a->total_power&0xFF); p[5] =(uint8_t)(a->total_power>>8);
+	p[6] =(uint8_t)(a->bpfo_energy&0xFF); p[7] =(uint8_t)(a->bpfo_energy>>8);
+	p[8] =(uint8_t)(a->bpfi_energy&0xFF); p[9] =(uint8_t)(a->bpfi_energy>>8);
+	p[10]=(uint8_t)(a->bsf_energy&0xFF);  p[11]=(uint8_t)(a->bsf_energy>>8);
+	p[12]=(uint8_t)(a->ftf_energy&0xFF);  p[13]=(uint8_t)(a->ftf_energy>>8);
+	p[14]=(uint8_t)(a->noise_floor&0xFF); p[15]=(uint8_t)(a->noise_floor>>8);
+	p[16]=(uint8_t)(a->snr_bpfo&0xFF);    p[17]=(uint8_t)(a->snr_bpfo>>8);
+	p[18]=0; p[19]=0;
+}
 
-	if (!reading->valid) {
-		return -EINVAL;
-	}
+int ble_transmit_fft_stats(uint16_t seq, uint16_t count,
+			   const fft_stats_t *stats)
+{
+	if (!current_conn) return -ENOTCONN;
+	if (!stats)        return -EINVAL;
 
-	/* Pack into a compact payload:
-	 * [temp_hi][temp_lo][hum_hi][hum_lo][press_hi][press_lo]
-	 * 6 bytes total — fits in one notification easily
-	 */
-	uint8_t payload[6];
-	payload[0] = (reading->temperature >> 8) & 0xFF;
-	payload[1] = reading->temperature & 0xFF;
-	payload[2] = (reading->humidity >> 8) & 0xFF;
-	payload[3] = reading->humidity & 0xFF;
-	payload[4] = (reading->pressure >> 8) & 0xFF;
-	payload[5] = reading->pressure & 0xFF;
+	uint8_t pkt[8 + 60];
+	encode_header(pkt, PKT_TYPE_FFT_STATS, seq, count, 0);
+	encode_axis_fft(pkt + 8,      &stats->x);
+	encode_axis_fft(pkt + 8 + 20, &stats->y);
+	encode_axis_fft(pkt + 8 + 40, &stats->z);
 
-	int err = bt_gatt_notify(current_conn,
-				 &vibration_svc.attrs[5],
-				 payload, sizeof(payload));
+	int err = notify_with_retry(&vibration_svc.attrs[2], pkt, sizeof(pkt));
 	if (err) {
-		LOG_ERR("BLE TX: Environment notify failed (err %d)", err);
+		LOG_ERR("BLE TX: FFT stats failed (err %d)", err);
 		return err;
 	}
 
-	LOG_DBG("BLE TX: Environment data sent "
-		"(T=%d.%02d°C H=%d.%02d%% P=%dhPa)",
+	LOG_INF("BLE TX: FFT stats seq=%u "
+		"X[dom=%uHz bpfo=%u snr=%u] "
+		"Y[dom=%uHz bpfo=%u] "
+		"Z[dom=%uHz bpfo=%u]",
+		seq,
+		stats->x.dom_freq_hz, stats->x.bpfo_energy, stats->x.snr_bpfo,
+		stats->y.dom_freq_hz, stats->y.bpfo_energy,
+		stats->z.dom_freq_hz, stats->z.bpfo_energy);
+	return 0;
+}
+
+/* ──────────────────────────────────────────────
+ * ble_transmit_burst_raw — optional raw sample dump
+ *
+ * Chunked: header (8) + up to 234 bytes of samples per packet.
+ * 234 / 6 = 39 samples/packet → 512 samples = 14 packets.
+ * PKT_TYPE_RAW.  Only used when SEND_RAW_BURST is enabled in fsm.c.
+ * ────────────────────────────────────────────── */
+#define RAW_SAMPLES_PER_PKT  ((MAX_PAYLOAD - 8) / sizeof(accel_sample_t))
+
+int ble_transmit_burst_raw(const accel_sample_t *buffer, uint16_t count,
+			   uint16_t seq)
+{
+	if (!current_conn)          return -ENOTCONN;
+	if (!buffer || count == 0)  return -EINVAL;
+
+	uint16_t n_packets = (count + RAW_SAMPLES_PER_PKT - 1) / RAW_SAMPLES_PER_PKT;
+
+	LOG_INF("BLE TX: raw burst seq=%u count=%u → %u packets",
+		seq, count, n_packets);
+
+	/* Stack-allocated packet buffer — 8 header + up to 234 payload */
+	uint8_t pkt[8 + RAW_SAMPLES_PER_PKT * sizeof(accel_sample_t)];
+
+	for (uint16_t chunk = 0; chunk < n_packets; chunk++) {
+		if (!current_conn) return -ENOTCONN;
+
+		uint16_t offset     = chunk * RAW_SAMPLES_PER_PKT;
+		uint16_t this_count = MIN((uint16_t)RAW_SAMPLES_PER_PKT,
+					  count - offset);
+		uint16_t payload_bytes = this_count * sizeof(accel_sample_t);
+
+		encode_header(pkt, PKT_TYPE_RAW, seq, count, chunk);
+		memcpy(pkt + 8, &buffer[offset], payload_bytes);
+
+		int err = notify_with_retry(&vibration_svc.attrs[2],
+					    pkt, 8 + payload_bytes);
+		if (err) {
+			LOG_ERR("BLE TX: raw chunk %u/%u failed (err %d)",
+				chunk, n_packets, err);
+			return err;
+		}
+		if (chunk < n_packets - 1) k_msleep(INTER_PACKET_MS);
+	}
+
+	LOG_INF("BLE TX: raw burst complete (%u packets)", n_packets);
+	return 0;
+}
+
+/* ──────────────────────────────────────────────
+ * ble_transmit_environment
+ *
+ * Wire: header (8) + temp(2) + hum(2) + pressure(4) = 16 bytes.
+ * PKT_TYPE_ENV.
+ * FIX vs original: pressure is uint32_t (Pa), encoded as 4 bytes.
+ * ────────────────────────────────────────────── */
+int ble_transmit_environment(const env_reading_t *reading)
+{
+	if (!current_conn)   return -ENOTCONN;
+	if (!reading->valid) return -EINVAL;
+
+	uint8_t pkt[8 + 8];
+	encode_header(pkt, PKT_TYPE_ENV, 0, 0, 0);
+
+	uint8_t *p = pkt + 8;
+	p[0]=(uint8_t)((uint16_t)reading->temperature&0xFF);
+	p[1]=(uint8_t)((uint16_t)reading->temperature>>8);
+	p[2]=(uint8_t)(reading->humidity&0xFF);
+	p[3]=(uint8_t)(reading->humidity>>8);
+	p[4]=(uint8_t)(reading->pressure&0xFF);
+	p[5]=(uint8_t)((reading->pressure>>8)&0xFF);
+	p[6]=(uint8_t)((reading->pressure>>16)&0xFF);
+	p[7]=(uint8_t)((reading->pressure>>24)&0xFF);
+
+	int err = notify_with_retry(&vibration_svc.attrs[5], pkt, sizeof(pkt));
+	if (err) {
+		LOG_ERR("BLE TX: env notify failed (err %d)", err);
+		return err;
+	}
+
+	LOG_DBG("BLE TX: env T=%d.%02d°C H=%d.%02d%% P=%uPa",
 		reading->temperature / 100,
-		reading->temperature % 100,
+		abs(reading->temperature % 100),
 		reading->humidity / 100,
 		reading->humidity % 100,
 		reading->pressure);
-
 	return 0;
 }
 
