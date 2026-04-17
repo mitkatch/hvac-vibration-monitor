@@ -126,7 +126,7 @@ typedef struct {
  * Modules like ble.c call this to post events.
  * The FSM registers its event queue handler during init.
  * ────────────────────────────────────────────── */
-typedef void (*event_post_fn)(const fsm_event_t *evt);
+typedef int (*event_post_fn)(fsm_event_t *evt);
 
 /* ──────────────────────────────────────────────
  * Public API Functions
