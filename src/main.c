@@ -42,8 +42,8 @@ static int system_init(void)
 	/* Initialize vibration sensor */
 	err = sensor_init_vibration();
 	if (err) {
-		LOG_ERR("ADXL343 init failed (err %d)", err);
-		return err;
+		LOG_WRN("ADXL343 init failed (err %d), continuing without", err);
+		/* Non-fatal: sensors not yet wired — revert once hardware is connected */
 	}
 
 	/* Initialize environmental sensor (optional) */

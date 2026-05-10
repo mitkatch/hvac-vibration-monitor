@@ -1,0 +1,70 @@
+/*
+ * Device Tree Overlay for Seeed Studio XIAO nRF52840
+ *
+ * Configures:
+ * - I2C0 for ADXL343 accelerometer + BME280 env sensor
+ *   SDA = D4 = P0.04
+ *   SCL = D5 = P0.05
+ * - LED0 alias for pairing indication (XIAO has 1 RGB LED)
+ * - Battery monitoring on AIN7 = P0.31
+ */
+
+/* ──────────────────────────────────────────────
+ * I2C Configuration
+ * D4 = P0.04 (SDA)
+ * D5 = P0.05 (SCL)
+ * ────────────────────────────────────────────── */
+&pinctrl {
+	i2c0_default: i2c0_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 4)>,
+				<NRF_PSEL(TWIM_SCL, 0, 5)>;
+		};
+	};
+
+	i2c0_sleep: i2c0_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 4)>,
+				<NRF_PSEL(TWIM_SCL, 0, 5)>;
+			low-power-enable;
+		};
+	};
+};
+
+&i2c0 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	adxl343: adxl343@53 {
+		compatible = "adi,adxl345";
+		reg = <0x53>;
+		status = "okay";
+	};
+
+	bme280: bme280@76 {
+		compatible = "bosch,bme280";
+		reg = <0x76>;
+		status = "okay";
+	};
+};
+
+/* ──────────────────────────────────────────────
+ * LED Note:
+ * xiao_ble board files already define:
+ *   led0 = Red   (P0.26)
+ *   led1 = Green (P0.30)
+ *   led2 = Blue  (P0.06)
+ * No overlay needed — use led0 alias directly in firmware.
+ * ────────────────────────────────────────────── */
+
+/* ──────────────────────────────────────────────
+ * Battery Monitoring
+ * AIN7 = P0.31 (passive voltage divider input)
+ * Used by battery level measurement code.
+ * No DTS node needed — accessed directly via
+ * nrfx_saadc in firmware.
+ * ────────────────────────────────────────────── */
