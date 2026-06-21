@@ -1,0 +1,12 @@
+# HVAC Vibration Monitor — project-level Kconfig
+
+mainmenu "HVAC Vibration Monitor"
+
+config HVAC_SENSOR_NAME
+	string "Sensor node name"
+	default "hvac-vibe-node-01"
+	help
+	  Human-readable name for this sensor node. Included in telemetry
+	  packets so the gateway can identify the source. Max 20 characters.
+
+source "Kconfig.zephyr"

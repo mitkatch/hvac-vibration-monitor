@@ -3,17 +3,14 @@
 cmake_minimum_required(VERSION 3.20.0)
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-target_compile_definitions(app PRIVATE BLE_NO_PAIRING)
 project(vibration_monitor)
 
 target_sources(app PRIVATE
     src/main.c
-    src/ble.c
+    src/thread.c
     src/sensor_adxl343.c
     src/sensor_bme280.c
     src/fsm.c
-    src/led.c
-    src/name_store.c
     src/analysis.c
     src/fft_fixed.c
     src/vib_ring.c

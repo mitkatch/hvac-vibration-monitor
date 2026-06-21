@@ -147,15 +147,19 @@ typedef struct {
 } bearing_params_t;
 
 /* ──────────────────────────────────────────────
- * Wire packet header (8 bytes, prepended to every BLE notification)
+ * Wire packet header — 10 bytes, prepended to every CoAP NON packet.
+ *
+ * All packets belonging to the same burst share the same seq and
+ * timestamp_ms, so the backend can group them by (source_addr, seq).
+ * type identifies which feature set the packet carries.
  * ────────────────────────────────────────────── */
 typedef struct {
-	uint8_t  type;
+	uint8_t  type;          /* PKT_TYPE_* */
 	uint8_t  reserved;
-	uint16_t seq;
-	uint16_t sample_count;
-	uint16_t chunk_index;
-} burst_header_t;
+	uint16_t seq;           /* monotonic burst counter */
+	uint16_t sample_count;  /* samples the analysis was computed from */
+	uint32_t timestamp_ms;  /* k_uptime_get_32() at burst collection */
+} __packed burst_header_t;
 
 #define PKT_TYPE_TIME_STATS  0x01
 #define PKT_TYPE_RAW         0x02

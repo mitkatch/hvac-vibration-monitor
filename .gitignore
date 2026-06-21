@@ -3,6 +3,7 @@
 # Zephyr RTOS Build Artifacts
 # ============================================
 build/
+build_1/
 .cache/
 .west/
 
