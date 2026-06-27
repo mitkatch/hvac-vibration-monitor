@@ -12,9 +12,10 @@
  *   4. thread_publish_burst(): send one vibration burst as 3 small CoAP NON
  *      POST packets, each fitting in a single 802.15.4 frame:
  *
- *        PKT_TYPE_TIME_STATS   burst_header(10) + time_stats(36) → 61 B CoAP
- *        PKT_TYPE_FFT_STATS    burst_header(10) + fft_stats(60)  → 85 B CoAP
- *        PKT_TYPE_ENV          burst_header(10) + env(8)          → 33 B CoAP  (optional)
+ *        PKT_TYPE_TIME_STATS   burst_header(26) + time_stats(36)    → 62 B CoAP
+ *        PKT_TYPE_FFT_STATS    burst_header(26) + fft_stats(60)    → 86 B CoAP
+ *        PKT_TYPE_ENV          burst_header(26) + env(8)            → 34 B CoAP  (optional)
+ *        PKT_TYPE_SPECTRUM     burst_header(26) + spectrum(76)      → 102 B CoAP (X axis, 0-237 Hz)
  *
  *      Single-frame capacity after MAC + AES-CCM overhead: ~106 bytes.
  *      All three packets carry the same seq and timestamp_ms so the backend
@@ -36,6 +37,7 @@
 
 #include "thread.h"
 #include "analysis.h"
+#include "name_store.h"
 
 LOG_MODULE_REGISTER(thread_net, LOG_LEVEL_INF);
 
@@ -74,8 +76,8 @@ static const uint8_t k_mesh_local_prefix[OT_IP6_PREFIX_SIZE] = {
 #define COAP_PORT      5683
 #define COAP_RESOURCE  "telemetry"
 
-/* Largest payload passed to send_ot_coap: burst_header + fft_stats */
-#define BODY_BUF_MAX   (sizeof(burst_header_t) + sizeof(fft_stats_t))
+/* Largest payload: burst_header + spectrum (80 B) > burst_header + fft_stats (60 B) */
+#define BODY_BUF_MAX   (sizeof(burst_header_t) + SPECTRUM_BINS)
 
 /* ── Module state ────────────────────────────────────────────────── */
 static event_post_fn  s_evt_post;
@@ -211,6 +213,8 @@ static int send_ot_coap(otInstance *ot,
 		.sample_count = count,
 		.timestamp_ms = timestamp_ms,
 	};
+	strncpy(hdr.name, name_store_get(), sizeof(hdr.name) - 1);
+	hdr.name[sizeof(hdr.name) - 1] = '\0';
 	memcpy(payload + plen, &hdr,  sizeof(hdr));  plen += sizeof(hdr);
 	memcpy(payload + plen, body, body_len);       plen += body_len;
 
@@ -389,6 +393,22 @@ int thread_publish_burst(uint16_t seq, uint16_t count, uint32_t timestamp_ms,
 		openthread_mutex_lock();
 		err = send_ot_coap(ot, PKT_TYPE_ENV, seq, count, timestamp_ms,
 				   env_buf, elen, &leader_rloc);
+		openthread_mutex_unlock();
+		if (!err) {
+			pkts++;
+		}
+	}
+
+	/* ── Packet 4: X-axis frequency spectrum (0-250 Hz) ──────────── */
+	/*    burst_header(10) + spectrum(80) = 90 B body → ~105 B CoAP  */
+	if (!err) {
+		uint8_t spec_buf[SPECTRUM_BINS];
+
+		analysis_get_spectrum_x(spec_buf, SPECTRUM_BINS);
+
+		openthread_mutex_lock();
+		err = send_ot_coap(ot, PKT_TYPE_SPECTRUM, seq, count, timestamp_ms,
+				   spec_buf, sizeof(spec_buf), &leader_rloc);
 		openthread_mutex_unlock();
 		if (!err) {
 			pkts++;

@@ -6,7 +6,8 @@ config HVAC_SENSOR_NAME
 	string "Sensor node name"
 	default "hvac-vibe-node-01"
 	help
-	  Human-readable name for this sensor node. Included in telemetry
-	  packets so the gateway can identify the source. Max 20 characters.
+	  Human-readable name for this sensor node. Sent in every CoAP packet
+	  header so the gateway uses it as the stable sensor ID. Max 15 characters
+	  (stored as 16 bytes null-padded in burst_header_t).
 
 source "Kconfig.zephyr"

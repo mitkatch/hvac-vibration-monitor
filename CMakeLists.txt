@@ -14,5 +14,6 @@ target_sources(app PRIVATE
     src/analysis.c
     src/fft_fixed.c
     src/vib_ring.c
+    src/name_store.c
     # src/sensor_piezo.c    # uncomment when hardware ready
 )

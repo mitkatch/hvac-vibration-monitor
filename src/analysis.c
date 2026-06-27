@@ -57,6 +57,9 @@ static int32_t fft_im[FFT_SIZE];
 /* Magnitude buffer: |X[k]|² stored as uint32_t to allow summing */
 static uint32_t fft_mag_sq[FFT_SIZE / 2];
 
+/* Saved X-axis spectrum — copied after X-axis FFT before Y overwrites fft_mag_sq */
+static uint32_t fft_spectrum_x[FFT_SIZE / 2];
+
 /* ──────────────────────────────────────────────
  * Bearing parameters (set by analysis_set_bearing_params)
  *
@@ -437,6 +440,8 @@ int analysis_compute_fft_stats(const accel_sample_t *buffer,
 	/* X axis */
 	for (uint16_t i = 0; i < N; i++) axis_buf[i] = buffer[i].x;
 	compute_axis_fft(axis_buf, N, &out->x);
+	/* Save X-axis magnitudes before Y-axis computation overwrites fft_mag_sq[] */
+	memcpy(fft_spectrum_x, fft_mag_sq, (N / 2) * sizeof(uint32_t));
 
 	/* Y axis */
 	for (uint16_t i = 0; i < N; i++) axis_buf[i] = buffer[i].y;
@@ -454,6 +459,29 @@ int analysis_compute_fft_stats(const accel_sample_t *buffer,
 		out->z.dom_freq_hz, out->z.bpfo_energy);
 
 	return 0;
+}
+
+/* ──────────────────────────────────────────────
+ * Spectrum export: normalised X-axis magnitudes
+ * ────────────────────────────────────────────── */
+void analysis_get_spectrum_x(uint8_t *mag_out, uint16_t n_bins)
+{
+	if (!mag_out || n_bins == 0) return;
+	if (n_bins > FFT_SIZE / 2) n_bins = FFT_SIZE / 2;
+
+	/* Find peak squared magnitude across the requested range (skip DC at 0) */
+	uint32_t peak = 1;
+	for (uint16_t k = 1; k < n_bins; k++) {
+		if (fft_spectrum_x[k] > peak) {
+			peak = fft_spectrum_x[k];
+		}
+	}
+
+	mag_out[0] = 0; /* DC bin — always suppress */
+	for (uint16_t k = 1; k < n_bins; k++) {
+		/* Normalise to 0-255: use 64-bit to avoid overflow before divide */
+		mag_out[k] = (uint8_t)(((uint64_t)fft_spectrum_x[k] * 255) / peak);
+	}
 }
 
 /* ──────────────────────────────────────────────
