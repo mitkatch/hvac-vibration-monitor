@@ -147,20 +147,34 @@ typedef struct {
 } bearing_params_t;
 
 /* ──────────────────────────────────────────────
- * Wire packet header (8 bytes, prepended to every BLE notification)
+ * Wire packet header — 10 bytes, prepended to every CoAP NON packet.
+ *
+ * All packets belonging to the same burst share the same seq and
+ * timestamp_ms, so the backend can group them by (source_addr, seq).
+ * type identifies which feature set the packet carries.
  * ────────────────────────────────────────────── */
 typedef struct {
-	uint8_t  type;
+	uint8_t  type;          /* PKT_TYPE_* */
 	uint8_t  reserved;
-	uint16_t seq;
-	uint16_t sample_count;
-	uint16_t chunk_index;
-} burst_header_t;
+	uint16_t seq;           /* monotonic burst counter */
+	uint16_t sample_count;  /* samples the analysis was computed from */
+	uint32_t timestamp_ms;  /* k_uptime_get_32() at burst collection */
+	char     name[16];      /* CONFIG_HVAC_SENSOR_NAME, null-padded — stable sensor ID */
+} __packed burst_header_t;  /* 26 bytes total */
 
 #define PKT_TYPE_TIME_STATS  0x01
 #define PKT_TYPE_RAW         0x02
 #define PKT_TYPE_ENV         0x03
 #define PKT_TYPE_FFT_STATS   0x04
+#define PKT_TYPE_SPECTRUM    0x05
+
+/*
+ * Number of FFT magnitude bins transmitted in PKT_TYPE_SPECTRUM.
+ * Bins 1-76 cover 3.1-237 Hz at 3.125 Hz/bin (1600 Hz / 512 points).
+ * 76 B body + 26 B burst_header = 102 B CoAP payload — fits in one 802.15.4 frame
+ * with margin (single-frame capacity ~106 B after MAC + AES-CCM overhead).
+ */
+#define SPECTRUM_BINS        76
 
 /* Legacy alias so existing fsm.c / ble_tx code compiles unchanged */
 typedef time_stats_t vibration_stats_t;
@@ -202,6 +216,17 @@ int analysis_compute_all(const accel_sample_t *buffer,
 			 uint16_t count,
 			 time_stats_t *time_out,
 			 fft_stats_t  *fft_out);
+
+/**
+ * Copy the X-axis FFT magnitude spectrum computed during the last
+ * analysis_compute_fft_stats() call into mag_out[0..n_bins-1] as
+ * uint8 values normalised to the peak bin (peak → 255, DC → 0).
+ *
+ * Must be called AFTER analysis_compute_fft_stats() / analysis_compute_all()
+ * and BEFORE the next call (the buffer is overwritten each burst).
+ * n_bins must be ≤ SPECTRUM_BINS.
+ */
+void analysis_get_spectrum_x(uint8_t *mag_out, uint16_t n_bins);
 
 /* Legacy shim */
 static inline int analysis_compute_stats(const accel_sample_t *buffer,
